@@ -5,6 +5,9 @@ edition = "2024"
 description = "Library for reading and writing iTunes Library.itl files"
 authors = ["Joseph R. Quinn <quinn.josephr@protonmail.com>"]
 license = "MIT"
+repository = "https://github.com/quinnjr/itl-rs"
+keywords = ["itunes", "itl", "music", "library", "parser"]
+categories = ["multimedia", "parser-implementations"]
 
 [dependencies]
 aes = "0.8"
