@@ -1,0 +1,12 @@
+[package]
+name = "itl-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Library for reading and writing iTunes Library.itl files"
+authors = ["Joseph R. Quinn <quinn.josephr@protonmail.com>"]
+license = "MIT"
+
+[dependencies]
+aes = "0.8"
+flate2 = "1"
+thiserror = "2"
