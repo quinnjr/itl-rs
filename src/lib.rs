@@ -192,7 +192,10 @@ impl std::fmt::Debug for ItlFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ItlFile")
             .field("version", &self.version())
-            .field("library_id", &format_args!("{:#018X}", self.library_persistent_id()))
+            .field(
+                "library_id",
+                &format_args!("{:#018X}", self.library_persistent_id()),
+            )
             .field("tracks", &self.tracks().len())
             .field("playlists", &self.playlists().len())
             .field("albums", &self.albums().len())
@@ -220,9 +223,7 @@ mod tests {
     fn test_from_bytes_too_short() {
         let result = ItlFile::from_bytes(&[0u8; 50]);
         assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), ItlError::UnexpectedEof(_)),
-        );
+        assert!(matches!(result.unwrap_err(), ItlError::UnexpectedEof(_)),);
     }
 
     #[test]
@@ -231,9 +232,7 @@ mod tests {
         data[0..4].copy_from_slice(b"XXXX");
         let result = ItlFile::from_bytes(&data);
         assert!(result.is_err());
-        assert!(
-            matches!(result.unwrap_err(), ItlError::InvalidMagic { .. }),
-        );
+        assert!(matches!(result.unwrap_err(), ItlError::InvalidMagic { .. }),);
     }
 
     fn build_minimal_itl() -> Vec<u8> {

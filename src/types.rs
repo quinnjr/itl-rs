@@ -282,6 +282,19 @@ impl Track {
         }
     }
 
+    /// 64-bit Persistent ID — stable across iTunes library rebuilds. Used
+    /// as the cross-sync identity key by consumers (e.g., TuxTunes) that
+    /// track iTunes imports over time.
+    ///
+    /// Layout: bytes 24..32 of the track's mhit header, little-endian.
+    pub fn persistent_id(&self) -> u64 {
+        if self.raw_header.len() >= 32 {
+            u64::from_le_bytes(self.raw_header[24..32].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
     fn field_str(&self, subtype: u32) -> Option<&str> {
         self.data_fields
             .iter()
@@ -542,7 +555,10 @@ mod tests {
     fn string_encoding_try_from_valid_and_invalid() {
         assert_eq!(StringEncoding::try_from(0u32), Ok(StringEncoding::Uri));
         assert_eq!(StringEncoding::try_from(1u32), Ok(StringEncoding::Utf16));
-        assert_eq!(StringEncoding::try_from(2u32), Ok(StringEncoding::EscapedUri));
+        assert_eq!(
+            StringEncoding::try_from(2u32),
+            Ok(StringEncoding::EscapedUri)
+        );
         assert_eq!(StringEncoding::try_from(3u32), Ok(StringEncoding::Utf8));
         assert_eq!(StringEncoding::try_from(99u32), Err(99u32));
     }
@@ -556,8 +572,14 @@ mod tests {
         assert_eq!(DataFieldType::from_u32(0x0004), Some(DataFieldType::Artist));
         assert_eq!(DataFieldType::from_u32(0x0003), Some(DataFieldType::Album));
         assert_eq!(DataFieldType::from_u32(0x0005), Some(DataFieldType::Genre));
-        assert_eq!(DataFieldType::from_u32(0x0064), Some(DataFieldType::PlaylistTitle));
-        assert_eq!(DataFieldType::from_u32(0x02BC), Some(DataFieldType::SmartPlaylistXml));
+        assert_eq!(
+            DataFieldType::from_u32(0x0064),
+            Some(DataFieldType::PlaylistTitle)
+        );
+        assert_eq!(
+            DataFieldType::from_u32(0x02BC),
+            Some(DataFieldType::SmartPlaylistXml)
+        );
         assert_eq!(DataFieldType::from_u32(0x9999), None);
     }
 
@@ -566,10 +588,7 @@ mod tests {
         for &st in &[
             0x0013u32, 0x0036, 0x0038, 0x0042, 0x0068, 0x006D, 0x0192, 0x0202, 0x02BC, 0x0320,
         ] {
-            assert!(
-                DataFieldType::is_raw_data_type(st),
-                "expected raw: {st:#x}"
-            );
+            assert!(DataFieldType::is_raw_data_type(st), "expected raw: {st:#x}");
         }
         for &st in &[0x0002u32, 0x0004, 0x0064] {
             assert!(
@@ -612,10 +631,7 @@ mod tests {
         let mut r = make_raw_field(0x11, b"bytes");
         r.set_string("text");
         match &r.content {
-            DataContent::String {
-                encoding,
-                value,
-            } => {
+            DataContent::String { encoding, value } => {
                 assert_eq!(*encoding, StringEncoding::Utf8);
                 assert_eq!(value, "text");
             }
@@ -777,7 +793,10 @@ mod tests {
         rh[12..16].copy_from_slice(&99u32.to_le_bytes());
         let mut p = Playlist {
             raw_header: rh,
-            data_fields: vec![make_string_field(DataFieldType::PlaylistTitle as u32, "My List")],
+            data_fields: vec![make_string_field(
+                DataFieldType::PlaylistTitle as u32,
+                "My List",
+            )],
             track_ids: vec![1, 2, 3],
         };
         assert_eq!(p.item_count(), 99);

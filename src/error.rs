@@ -6,7 +6,10 @@ pub enum ItlError {
     Io(#[from] std::io::Error),
 
     #[error("invalid magic: expected {expected:?}, got {got:?}")]
-    InvalidMagic { expected: &'static [u8], got: Vec<u8> },
+    InvalidMagic {
+        expected: &'static [u8],
+        got: Vec<u8>,
+    },
 
     #[error("decompression failed: {0}")]
     Decompression(String),

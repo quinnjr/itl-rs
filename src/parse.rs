@@ -139,10 +139,22 @@ pub(crate) enum SectionRef {
 pub(crate) enum MsdhContent {
     InnerHeader,
     LibraryInfo,
-    TrackList { raw_header: Vec<u8>, range: std::ops::Range<usize> },
-    AlbumList { raw_header: Vec<u8>, range: std::ops::Range<usize> },
-    ArtistList { raw_header: Vec<u8>, range: std::ops::Range<usize> },
-    PlaylistList { raw_header: Vec<u8>, range: std::ops::Range<usize> },
+    TrackList {
+        raw_header: Vec<u8>,
+        range: std::ops::Range<usize>,
+    },
+    AlbumList {
+        raw_header: Vec<u8>,
+        range: std::ops::Range<usize>,
+    },
+    ArtistList {
+        raw_header: Vec<u8>,
+        range: std::ops::Range<usize>,
+    },
+    PlaylistList {
+        raw_header: Vec<u8>,
+        range: std::ops::Range<usize>,
+    },
     RawBlob(Vec<u8>),
     Unknown(Vec<u8>),
 }
@@ -252,8 +264,7 @@ fn parse_msdh(cursor: &mut Cursor, msdh_start: usize, library: &mut ParsedLibrar
     let assoc_length = cursor.read_u32_le()? as usize;
     let subtype = cursor.read_u32_le()?;
 
-    let msdh_header_bytes = cursor.data[msdh_start..msdh_start + section_length]
-        .to_vec();
+    let msdh_header_bytes = cursor.data[msdh_start..msdh_start + section_length].to_vec();
 
     // Skip to end of msdh header
     let remaining_header = section_length.saturating_sub(16);
@@ -300,9 +311,7 @@ fn parse_msdh(cursor: &mut Cursor, msdh_start: usize, library: &mut ParsedLibrar
         // mlah albums
         9 => {
             let master_header = parse_master_header(cursor, b"mlah")?;
-            let count = u32::from_le_bytes(
-                master_header[8..12].try_into().unwrap()
-            );
+            let count = u32::from_le_bytes(master_header[8..12].try_into().unwrap());
             let start_idx = library.albums.len();
             for _ in 0..count {
                 if cursor.remaining() < 8 || cursor.pos() >= content_end {
@@ -324,9 +333,7 @@ fn parse_msdh(cursor: &mut Cursor, msdh_start: usize, library: &mut ParsedLibrar
         // mlih artists
         11 => {
             let master_header = parse_master_header(cursor, b"mlih")?;
-            let count = u32::from_le_bytes(
-                master_header[8..12].try_into().unwrap()
-            );
+            let count = u32::from_le_bytes(master_header[8..12].try_into().unwrap());
             let start_idx = library.artists.len();
             for _ in 0..count {
                 if cursor.remaining() < 8 || cursor.pos() >= content_end {
@@ -348,9 +355,7 @@ fn parse_msdh(cursor: &mut Cursor, msdh_start: usize, library: &mut ParsedLibrar
         // mlth tracks (subtypes 1 and 13)
         1 | 13 => {
             let master_header = parse_master_header(cursor, b"mlth")?;
-            let count = u32::from_le_bytes(
-                master_header[8..12].try_into().unwrap()
-            );
+            let count = u32::from_le_bytes(master_header[8..12].try_into().unwrap());
             let start_idx = library.tracks.len();
             for _ in 0..count {
                 if cursor.remaining() < 8 || cursor.pos() >= content_end {
@@ -590,7 +595,11 @@ pub(crate) fn parse_artist_item(cursor: &mut Cursor) -> Result<Artist> {
     })
 }
 
-fn parse_playlists(cursor: &mut Cursor, section_end: usize, library: &mut ParsedLibrary) -> Result<()> {
+fn parse_playlists(
+    cursor: &mut Cursor,
+    section_end: usize,
+    library: &mut ParsedLibrary,
+) -> Result<()> {
     let mut current_playlist: Option<Playlist> = None;
 
     while cursor.remaining() >= 8 && cursor.pos() < section_end {
@@ -733,7 +742,9 @@ pub(crate) fn parse_mhoh(cursor: &mut Cursor) -> Result<DataField> {
         let _padding = cursor.read_bytes(8)?;
 
         let actual_string_size = data_size.saturating_sub(16);
-        let read_size = actual_string_size.min(string_length).min(cursor.remaining());
+        let read_size = actual_string_size
+            .min(string_length)
+            .min(cursor.remaining());
 
         let string_bytes = cursor.read_bytes(read_size)?;
 
@@ -787,9 +798,9 @@ fn decode_string(encoding: StringEncoding, bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ItlError;
     #[allow(unused_imports)]
     use crate::types::*;
-    use crate::ItlError;
 
     fn build_mhoh_flex(subtype: u32, encoding: u32, string_bytes: &[u8]) -> Vec<u8> {
         let total_length: u32 = 24 + 16 + string_bytes.len() as u32;
@@ -1499,7 +1510,10 @@ mod tests {
         let blob = build_msdh(12, &mhgh);
         let lib = parse_inner(&blob).unwrap();
         assert!(lib.library_info.is_some());
-        assert_eq!(lib.library_info.as_ref().unwrap().share_name(), Some("My Share"));
+        assert_eq!(
+            lib.library_info.as_ref().unwrap().share_name(),
+            Some("My Share")
+        );
     }
 
     #[test]
@@ -1515,7 +1529,10 @@ mod tests {
         let lib = parse_inner(&buf).unwrap();
         assert_eq!(lib.section_order.len(), 1);
         match &lib.section_order[0] {
-            SectionRef::Msdh { content: MsdhContent::RawBlob(blob), .. } => {
+            SectionRef::Msdh {
+                content: MsdhContent::RawBlob(blob),
+                ..
+            } => {
                 assert!(blob.is_empty());
             }
             _ => panic!("expected RawBlob"),

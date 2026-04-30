@@ -68,7 +68,10 @@ fn write_section(w: &mut Writer, section_ref: &SectionRef, library: &ParsedLibra
                         write_library_info(w, info)?;
                     }
                 }
-                MsdhContent::TrackList { raw_header: master, range } => {
+                MsdhContent::TrackList {
+                    raw_header: master,
+                    range,
+                } => {
                     let master_start = w.pos();
                     w.write_bytes(master);
                     let items = &library.tracks[range.clone()];
@@ -78,7 +81,10 @@ fn write_section(w: &mut Writer, section_ref: &SectionRef, library: &ParsedLibra
                         write_track_item(w, track)?;
                     }
                 }
-                MsdhContent::AlbumList { raw_header: master, range } => {
+                MsdhContent::AlbumList {
+                    raw_header: master,
+                    range,
+                } => {
                     let master_start = w.pos();
                     w.write_bytes(master);
                     let items = &library.albums[range.clone()];
@@ -88,7 +94,10 @@ fn write_section(w: &mut Writer, section_ref: &SectionRef, library: &ParsedLibra
                         write_album_item(w, album)?;
                     }
                 }
-                MsdhContent::ArtistList { raw_header: master, range } => {
+                MsdhContent::ArtistList {
+                    raw_header: master,
+                    range,
+                } => {
                     let master_start = w.pos();
                     w.write_bytes(master);
                     let items = &library.artists[range.clone()];
@@ -98,7 +107,10 @@ fn write_section(w: &mut Writer, section_ref: &SectionRef, library: &ParsedLibra
                         write_artist_item(w, artist)?;
                     }
                 }
-                MsdhContent::PlaylistList { raw_header: master, range } => {
+                MsdhContent::PlaylistList {
+                    raw_header: master,
+                    range,
+                } => {
                     w.write_bytes(master);
                     for playlist in &library.playlists[range.clone()] {
                         write_playlist(w, playlist)?;
@@ -502,10 +514,7 @@ mod tests {
         let data = &w.buf;
         assert_eq!(&data[0..4], b"miph");
         // Verify mtph entries are present
-        let mtph_count = data
-            .windows(4)
-            .filter(|w| *w == b"mtph")
-            .count();
+        let mtph_count = data.windows(4).filter(|w| *w == b"mtph").count();
         assert_eq!(mtph_count, 3);
     }
 
@@ -668,7 +677,11 @@ mod tests {
         assert!(!result.is_empty());
         // Verify the track count was patched in the master header
         let master_offset = 96; // after msdh header
-        let count = u32::from_le_bytes(result[master_offset + 8..master_offset + 12].try_into().unwrap());
+        let count = u32::from_le_bytes(
+            result[master_offset + 8..master_offset + 12]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(count, 1);
     }
 

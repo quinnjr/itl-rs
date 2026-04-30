@@ -13,35 +13,80 @@ fn open_and_read() {
     assert!(lib.tz_offset_seconds() != 0);
     assert!(lib.library_date_unix() > 0);
 
-    assert!(lib.tracks().len() > 1000, "expected many tracks, got {}", lib.tracks().len());
-    assert!(lib.albums().len() > 100, "expected many albums, got {}", lib.albums().len());
-    assert!(lib.artists().len() > 100, "expected many artists, got {}", lib.artists().len());
-    assert!(lib.playlists().len() > 10, "expected many playlists, got {}", lib.playlists().len());
+    assert!(
+        lib.tracks().len() > 1000,
+        "expected many tracks, got {}",
+        lib.tracks().len()
+    );
+    assert!(
+        lib.albums().len() > 100,
+        "expected many albums, got {}",
+        lib.albums().len()
+    );
+    assert!(
+        lib.artists().len() > 100,
+        "expected many artists, got {}",
+        lib.artists().len()
+    );
+    assert!(
+        lib.playlists().len() > 10,
+        "expected many playlists, got {}",
+        lib.playlists().len()
+    );
 
     // Verify track metadata is present
     let tracks_with_title = lib.tracks().iter().filter(|t| t.title().is_some()).count();
     let tracks_with_artist = lib.tracks().iter().filter(|t| t.artist().is_some()).count();
-    assert!(tracks_with_title > 1000, "expected most tracks to have titles, got {}", tracks_with_title);
-    assert!(tracks_with_artist > 1000, "expected most tracks to have artists, got {}", tracks_with_artist);
+    assert!(
+        tracks_with_title > 1000,
+        "expected most tracks to have titles, got {}",
+        tracks_with_title
+    );
+    assert!(
+        tracks_with_artist > 1000,
+        "expected most tracks to have artists, got {}",
+        tracks_with_artist
+    );
 
     // Verify albums have names
     let albums_with_name = lib.albums().iter().filter(|a| a.name().is_some()).count();
-    assert!(albums_with_name > 100, "expected most albums to have names, got {}", albums_with_name);
+    assert!(
+        albums_with_name > 100,
+        "expected most albums to have names, got {}",
+        albums_with_name
+    );
 
     // Verify artists have names
     let artists_with_name = lib.artists().iter().filter(|a| a.name().is_some()).count();
-    assert!(artists_with_name > 100, "expected most artists to have names, got {}", artists_with_name);
+    assert!(
+        artists_with_name > 100,
+        "expected most artists to have names, got {}",
+        artists_with_name
+    );
 
     // Verify playlists
-    let playlists_with_title = lib.playlists().iter().filter(|p| p.title().is_some()).count();
-    assert!(playlists_with_title > 5, "expected playlists with titles, got {}", playlists_with_title);
+    let playlists_with_title = lib
+        .playlists()
+        .iter()
+        .filter(|p| p.title().is_some())
+        .count();
+    assert!(
+        playlists_with_title > 5,
+        "expected playlists with titles, got {}",
+        playlists_with_title
+    );
 
     // Verify playlist track resolution
-    let first_playlist_with_tracks = lib.playlists().iter()
+    let first_playlist_with_tracks = lib
+        .playlists()
+        .iter()
         .find(|p| !p.track_ids().is_empty())
         .expect("expected at least one playlist with tracks");
     let resolved = lib.playlist_tracks(first_playlist_with_tracks);
-    assert!(!resolved.is_empty(), "expected to resolve at least some playlist tracks");
+    assert!(
+        !resolved.is_empty(),
+        "expected to resolve at least some playlist tracks"
+    );
 
     // Verify track_by_id lookup
     let first_track_id = lib.tracks()[0].id();
@@ -49,9 +94,17 @@ fn open_and_read() {
     assert!(found.is_some(), "track_by_id should find a track");
     assert_eq!(found.unwrap().id(), first_track_id);
 
-    println!("READ OK: {} tracks, {} albums, {} artists, {} playlists",
-        lib.tracks().len(), lib.albums().len(), lib.artists().len(), lib.playlists().len());
-    println!("  tracks with title: {}, with artist: {}", tracks_with_title, tracks_with_artist);
+    println!(
+        "READ OK: {} tracks, {} albums, {} artists, {} playlists",
+        lib.tracks().len(),
+        lib.albums().len(),
+        lib.artists().len(),
+        lib.playlists().len()
+    );
+    println!(
+        "  tracks with title: {}, with artist: {}",
+        tracks_with_title, tracks_with_artist
+    );
 }
 
 #[test]
@@ -66,7 +119,11 @@ fn round_trip_write() {
 
     // Serialize to bytes
     let bytes = lib.to_bytes().expect("failed to serialize");
-    assert!(bytes.len() > 1000, "serialized output too small: {}", bytes.len());
+    assert!(
+        bytes.len() > 1000,
+        "serialized output too small: {}",
+        bytes.len()
+    );
 
     // Re-parse from serialized bytes
     let lib2 = ItlFile::from_bytes(&bytes).expect("failed to re-parse serialized ITL");
@@ -88,7 +145,10 @@ fn round_trip_write() {
         assert_eq!(orig.genre(), rt.genre(), "genre mismatch at index {i}");
     }
 
-    println!("ROUND-TRIP OK: serialized {} bytes, all counts and metadata match", bytes.len());
+    println!(
+        "ROUND-TRIP OK: serialized {} bytes, all counts and metadata match",
+        bytes.len()
+    );
 }
 
 #[test]
@@ -116,6 +176,73 @@ fn mutation() {
     let orig_second_title = lib.tracks()[1].title().map(String::from);
     assert_eq!(lib2.tracks()[1].title(), orig_second_title.as_deref());
 
-    println!("MUTATION OK: changed {:?} -> \"Test Title 12345\", {:?} -> \"Test Artist 67890\", survived round-trip",
-        original_title, original_artist);
+    println!(
+        "MUTATION OK: changed {:?} -> \"Test Title 12345\", {:?} -> \"Test Artist 67890\", survived round-trip",
+        original_title, original_artist
+    );
+}
+
+#[test]
+fn track_persistent_id_is_nonzero_and_stable_across_reopens() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini.itl");
+    if !path.exists() {
+        eprintln!("skipping: tests/fixtures/mini.itl not present");
+        return;
+    }
+
+    let lib1 = itl_rs::ItlFile::open(&path).unwrap();
+    let lib2 = itl_rs::ItlFile::open(&path).unwrap();
+
+    assert!(!lib1.tracks().is_empty(), "fixture has no tracks");
+    for (t1, t2) in lib1.tracks().iter().zip(lib2.tracks().iter()) {
+        assert_ne!(t1.persistent_id(), 0, "persistent_id should be nonzero");
+        assert_eq!(
+            t1.persistent_id(),
+            t2.persistent_id(),
+            "persistent_id must be stable across reopens",
+        );
+    }
+}
+
+#[test]
+fn track_persistent_ids_are_mostly_unique_within_fixture() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini.itl");
+    if !path.exists() {
+        eprintln!("skipping: tests/fixtures/mini.itl not present");
+        return;
+    }
+
+    let lib = itl_rs::ItlFile::open(&path).unwrap();
+    let mut pid_counts = std::collections::HashMap::new();
+    let mut zero_count = 0;
+
+    for t in lib.tracks() {
+        let pid = t.persistent_id();
+        if pid == 0 {
+            zero_count += 1;
+        } else {
+            *pid_counts.entry(pid).or_insert(0) += 1;
+        }
+    }
+
+    // Verify no tracks have zero persistent_id
+    assert_eq!(
+        zero_count, 0,
+        "found {} tracks with persistent_id=0",
+        zero_count
+    );
+
+    // Verify the vast majority of persistent_ids are unique
+    // (allow for some duplicates due to iTunes import behavior)
+    let total_tracks = lib.tracks().len();
+    let unique_pids = pid_counts.len();
+    let uniqueness_ratio = unique_pids as f64 / total_tracks as f64;
+
+    assert!(
+        uniqueness_ratio > 0.95,
+        "persistent_id uniqueness too low: {}/{} = {:.2}% (expected >95%)",
+        unique_pids,
+        total_tracks,
+        uniqueness_ratio * 100.0
+    );
 }
