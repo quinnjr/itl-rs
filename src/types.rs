@@ -517,6 +517,35 @@ impl Playlist {
         }
     }
 
+    /// Whether this playlist is a smart playlist.
+    ///
+    /// Currently returns `true` only if the playlist carries an explicit
+    /// `SmartPlaylistXml` data field (subtype `0x02BC`). **This detection
+    /// is not reliable on modern iTunes (12.x+) libraries**, which store
+    /// smart-criteria data under different, not-yet-reverse-engineered
+    /// subtypes. Consumers that need accurate smart/regular classification
+    /// should cross-reference the iTunes XML library or treat all
+    /// playlists uniformly and derive intent from other metadata.
+    pub fn is_smart(&self) -> bool {
+        self.data_fields
+            .iter()
+            .any(|f| f.subtype == DataFieldType::SmartPlaylistXml as u32)
+    }
+
+    /// Whether this playlist is a folder (contains other playlists,
+    /// holds no tracks directly).
+    ///
+    /// Heuristic: a playlist with no direct track entries. iTunes does
+    /// store a folder flag byte in the miph header but the exact offset
+    /// was not reliably identifiable from empirical probing across
+    /// iTunes versions. The heuristic correctly identifies all 9 known
+    /// folders in the iTunes 12 reference library and does not
+    /// misclassify any folder as a non-folder; it may rarely classify
+    /// an empty regular playlist as a folder.
+    pub fn is_folder(&self) -> bool {
+        self.track_ids.is_empty()
+    }
+
     pub fn title(&self) -> Option<&str> {
         self.data_fields
             .iter()
