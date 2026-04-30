@@ -246,3 +246,71 @@ fn track_persistent_ids_are_mostly_unique_within_fixture() {
         uniqueness_ratio * 100.0
     );
 }
+
+#[test]
+fn playlist_persistent_id_is_nonzero_and_mostly_unique() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini.itl");
+    if !path.exists() {
+        eprintln!("skipping: tests/fixtures/mini.itl not present");
+        return;
+    }
+
+    let lib = itl_rs::ItlFile::open(&path).unwrap();
+    assert!(!lib.playlists().is_empty(), "fixture has no playlists");
+
+    let mut seen = std::collections::HashSet::new();
+    let mut zeros = 0usize;
+    for p in lib.playlists() {
+        let pid = p.persistent_id();
+        if pid == 0 {
+            zeros += 1;
+        } else {
+            seen.insert(pid);
+        }
+    }
+
+    let total = lib.playlists().len();
+    assert!(
+        zeros < total / 20,
+        "too many zero persistent_ids: {zeros} of {total}",
+    );
+    let ratio = seen.len() as f64 / (total - zeros) as f64;
+    assert!(
+        ratio > 0.95,
+        "playlist persistent_id uniqueness too low: {:.2}%",
+        ratio * 100.0,
+    );
+}
+
+#[test]
+fn playlist_parent_persistent_ids_resolve_to_known_playlists() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini.itl");
+    if !path.exists() {
+        eprintln!("skipping: tests/fixtures/mini.itl not present");
+        return;
+    }
+
+    let lib = itl_rs::ItlFile::open(&path).unwrap();
+    let known: std::collections::HashSet<u64> =
+        lib.playlists().iter().map(|p| p.persistent_id()).collect();
+
+    let mut any_parent = false;
+    let mut resolved = 0usize;
+    let mut total = 0usize;
+    for p in lib.playlists() {
+        if let Some(parent) = p.parent_persistent_id() {
+            any_parent = true;
+            total += 1;
+            if known.contains(&parent) {
+                resolved += 1;
+            }
+        }
+    }
+    assert!(any_parent, "fixture should contain folder-nested playlists",);
+    let ratio = resolved as f64 / total as f64;
+    assert!(
+        ratio > 0.95,
+        "only {resolved}/{total} parent pids resolve ({:.1}%)",
+        ratio * 100.0,
+    );
+}

@@ -477,6 +477,38 @@ pub struct Playlist {
 }
 
 impl Playlist {
+    /// 64-bit Persistent ID — stable across iTunes library rebuilds. Used
+    /// by consumers (e.g. TuxTunes sync) to correlate the same playlist
+    /// across re-imports.
+    ///
+    /// Layout: bytes 432..440 of the miph header, little-endian. Offset
+    /// confirmed empirically by matching against ground-truth values in
+    /// `iTunes Music Library.xml` (427/431 coverage; the 4 misses are
+    /// duplicated playlists the XML deduplicated but the ITL kept
+    /// separate).
+    pub fn persistent_id(&self) -> u64 {
+        if self.raw_header.len() >= 440 {
+            u64::from_le_bytes(self.raw_header[432..440].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    /// Persistent ID of this playlist's parent folder, if any. Returns
+    /// `None` at the root or when the header is too short.
+    ///
+    /// Layout: bytes 520..528 of the miph header, little-endian. Offset
+    /// confirmed empirically against `iTunes Music Library.xml`'s
+    /// `<Parent Persistent ID>` entries (393/395 coverage).
+    pub fn parent_persistent_id(&self) -> Option<u64> {
+        if self.raw_header.len() >= 528 {
+            let pid = u64::from_le_bytes(self.raw_header[520..528].try_into().unwrap());
+            if pid == 0 { None } else { Some(pid) }
+        } else {
+            None
+        }
+    }
+
     pub fn item_count(&self) -> u32 {
         if self.raw_header.len() > 16 {
             u32::from_le_bytes(self.raw_header[12..16].try_into().unwrap())
