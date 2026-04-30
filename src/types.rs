@@ -388,6 +388,119 @@ impl Track {
     pub fn data_fields_mut(&mut self) -> &mut Vec<DataField> {
         &mut self.data_fields
     }
+
+    /// Size of the source audio file, in bytes. Layout: bytes 28..32 of
+    /// the mhit header, little-endian. 0 when absent.
+    pub fn size_bytes(&self) -> u32 {
+        if self.raw_header.len() >= 32 {
+            u32::from_le_bytes(self.raw_header[28..32].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    /// Total playing time, in milliseconds. Layout: bytes 32..36 of the
+    /// mhit header, little-endian. 0 when absent.
+    pub fn duration_ms(&self) -> u32 {
+        if self.raw_header.len() >= 36 {
+            u32::from_le_bytes(self.raw_header[32..36].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    /// Track number within its album, 1-based. Layout: bytes 36..38 of
+    /// the mhit header, little-endian u16. `None` when unset (0).
+    pub fn track_number(&self) -> Option<u16> {
+        if self.raw_header.len() >= 38 {
+            let n = u16::from_le_bytes(self.raw_header[36..38].try_into().unwrap());
+            if n == 0 { None } else { Some(n) }
+        } else {
+            None
+        }
+    }
+
+    /// Total number of tracks on the album. Layout: bytes 40..42 of the
+    /// mhit header, little-endian u16. `None` when unset (0).
+    pub fn track_count(&self) -> Option<u16> {
+        if self.raw_header.len() >= 42 {
+            let n = u16::from_le_bytes(self.raw_header[40..42].try_into().unwrap());
+            if n == 0 { None } else { Some(n) }
+        } else {
+            None
+        }
+    }
+
+    /// Release year. Layout: bytes 44..46 of the mhit header,
+    /// little-endian u16. `None` when unset (0).
+    pub fn year(&self) -> Option<u16> {
+        if self.raw_header.len() >= 46 {
+            let n = u16::from_le_bytes(self.raw_header[44..46].try_into().unwrap());
+            if n == 0 { None } else { Some(n) }
+        } else {
+            None
+        }
+    }
+
+    /// Bit rate, in kbps. Layout: bytes 48..50 of the mhit header,
+    /// little-endian u16. 0 when absent.
+    pub fn bit_rate(&self) -> u16 {
+        if self.raw_header.len() >= 50 {
+            u16::from_le_bytes(self.raw_header[48..50].try_into().unwrap())
+        } else {
+            0
+        }
+    }
+
+    /// Disc number within a multi-disc album, 1-based. Layout: bytes
+    /// 96..98 of the mhit header, little-endian u16. `None` when unset.
+    pub fn disc_number(&self) -> Option<u16> {
+        if self.raw_header.len() >= 98 {
+            let n = u16::from_le_bytes(self.raw_header[96..98].try_into().unwrap());
+            if n == 0 { None } else { Some(n) }
+        } else {
+            None
+        }
+    }
+
+    /// Total number of discs in the album. Layout: bytes 98..100 of the
+    /// mhit header, little-endian u16. `None` when unset.
+    pub fn disc_count(&self) -> Option<u16> {
+        if self.raw_header.len() >= 100 {
+            let n = u16::from_le_bytes(self.raw_header[98..100].try_into().unwrap());
+            if n == 0 { None } else { Some(n) }
+        } else {
+            None
+        }
+    }
+
+    /// Sample rate in Hz. iTunes stores it as an IEEE-754 f32 LE at
+    /// bytes 144..148 of the mhit header (e.g. 44100.0, 48000.0). The
+    /// value is rounded to the nearest u32 here; 0 is returned when
+    /// absent or the stored float is non-finite.
+    pub fn sample_rate(&self) -> u32 {
+        if self.raw_header.len() >= 148 {
+            let f = f32::from_le_bytes(self.raw_header[144..148].try_into().unwrap());
+            if f.is_finite() && f >= 0.0 {
+                f.round() as u32
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    }
+
+    /// Beats-per-minute. Layout: bytes 156..158 of the mhit header,
+    /// little-endian u16. `None` when unset (0).
+    pub fn bpm(&self) -> Option<u16> {
+        if self.raw_header.len() >= 158 {
+            let n = u16::from_le_bytes(self.raw_header[156..158].try_into().unwrap());
+            if n == 0 { None } else { Some(n) }
+        } else {
+            None
+        }
+    }
 }
 
 /// An album in the iTunes library.

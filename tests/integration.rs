@@ -341,6 +341,138 @@ fn folders_have_no_tracks() {
 }
 
 #[test]
+fn track_audio_accessors_parse_reasonably() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini.itl");
+    if !path.exists() {
+        eprintln!("skipping: tests/fixtures/mini.itl not present");
+        return;
+    }
+
+    let lib = itl_rs::ItlFile::open(&path).unwrap();
+    let total = lib.tracks().len();
+    assert!(total > 0);
+
+    let mut with_size = 0;
+    let mut with_duration = 0;
+    let mut with_bit_rate = 0;
+    let mut with_sample_rate = 0;
+    let mut sample_rate_in_range = 0;
+    let mut duration_in_range = 0;
+
+    for t in lib.tracks() {
+        if t.size_bytes() > 0 {
+            with_size += 1;
+        }
+        let d = t.duration_ms();
+        if d > 0 {
+            with_duration += 1;
+            // Typical music tracks: 5 seconds to 4 hours.
+            if (5_000..=4 * 60 * 60 * 1000).contains(&d) {
+                duration_in_range += 1;
+            }
+        }
+        if t.bit_rate() > 0 {
+            with_bit_rate += 1;
+        }
+        let sr = t.sample_rate();
+        if sr > 0 {
+            with_sample_rate += 1;
+            // Accept the common CD/DVD/HD rates.
+            if matches!(
+                sr,
+                22050 | 32000 | 44100 | 48000 | 88200 | 96000 | 176400 | 192000
+            ) {
+                sample_rate_in_range += 1;
+            }
+        }
+    }
+
+    // The vast majority of tracks in a real library have these fields.
+    assert!(
+        with_size * 100 / total >= 95,
+        "size: only {with_size}/{total} tracks populated",
+    );
+    assert!(
+        with_duration * 100 / total >= 95,
+        "duration: only {with_duration}/{total} tracks populated",
+    );
+    assert!(
+        duration_in_range * 100 / with_duration.max(1) >= 95,
+        "duration sanity: only {duration_in_range}/{with_duration} in 5s..4h range",
+    );
+    assert!(
+        with_bit_rate * 100 / total >= 95,
+        "bit_rate: only {with_bit_rate}/{total} tracks populated",
+    );
+    assert!(
+        with_sample_rate * 100 / total >= 95,
+        "sample_rate: only {with_sample_rate}/{total} tracks populated",
+    );
+    assert!(
+        sample_rate_in_range * 100 / with_sample_rate.max(1) >= 95,
+        "sample_rate sanity: only {sample_rate_in_range}/{with_sample_rate} at known standard rates",
+    );
+}
+
+#[test]
+fn track_small_numeric_accessors_degrade_gracefully() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini.itl");
+    if !path.exists() {
+        eprintln!("skipping: tests/fixtures/mini.itl not present");
+        return;
+    }
+
+    let lib = itl_rs::ItlFile::open(&path).unwrap();
+
+    // track_number, disc_number, year, bpm are Option<u16> and correctly
+    // unset across many tracks. We assert three things: Some(0) never
+    // occurs; at least one track populates each field; and the large
+    // majority of populated values are in plausible ranges. (iTunes
+    // preserves whatever the user or importer wrote, so a handful of
+    // tracks with nonsense years or BPMs is expected.)
+    let mut any_track_number = false;
+    let mut any_disc_number = false;
+    let mut year_total = 0usize;
+    let mut year_sane = 0usize;
+    let mut bpm_total = 0usize;
+    let mut bpm_sane = 0usize;
+    for t in lib.tracks() {
+        if let Some(n) = t.track_number() {
+            assert!(n > 0, "track_number returned Some(0)");
+            any_track_number = true;
+        }
+        if let Some(n) = t.disc_number() {
+            assert!(n > 0, "disc_number returned Some(0)");
+            any_disc_number = true;
+        }
+        if let Some(y) = t.year() {
+            year_total += 1;
+            if (1900..=2100).contains(&y) {
+                year_sane += 1;
+            }
+        }
+        if let Some(b) = t.bpm() {
+            bpm_total += 1;
+            if (1..=400).contains(&b) {
+                bpm_sane += 1;
+            }
+        }
+    }
+    assert!(any_track_number, "expected some track with track_number");
+    assert!(any_disc_number, "expected some track with disc_number");
+    assert!(year_total > 0, "expected some track with year");
+    assert!(bpm_total > 0, "expected some track with bpm");
+    assert!(
+        year_sane * 100 / year_total >= 99,
+        "year sanity: {year_sane}/{year_total} in 1900..=2100",
+    );
+    assert!(
+        bpm_sane * 100 / bpm_total >= 99,
+        "bpm sanity: {bpm_sane}/{bpm_total} in 1..=400",
+    );
+}
+
+#[test]
 fn playlist_parent_persistent_ids_resolve_to_known_playlists() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini.itl");
     if !path.exists() {
