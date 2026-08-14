@@ -91,6 +91,9 @@ impl<'a> Cursor<'a> {
 }
 
 /// Subtypes of msdh sections that contain raw data blobs (no subsections).
+/// Observed empirically in iTunes 12.x libraries; a subtype missing from
+/// this set falls through to the master-signature parsers and, failing
+/// those, is preserved verbatim as `MsdhContent::Unknown`.
 fn msdh_is_raw_data_subtype(subtype: u32) -> bool {
     matches!(subtype, 3 | 4 | 19 | 22)
 }
@@ -104,8 +107,10 @@ pub struct ParsedLibrary {
     pub albums: Vec<Album>,
     pub artists: Vec<Artist>,
     pub playlists: Vec<Playlist>,
-    pub raw_sections: Vec<RawSection>,
     /// Ordered list of top-level sections for round-trip serialization.
+    /// Non-msdh sections are held here as `SectionRef::Raw` — the single
+    /// owner of their bytes; `ItlFile::raw_sections()` derives its view
+    /// from this list.
     pub(crate) section_order: Vec<SectionRef>,
 }
 
@@ -133,6 +138,9 @@ pub(crate) enum SectionRef {
         subtype: u32,
         content: MsdhContent,
     },
+    /// A non-msdh top-level section, re-emitted verbatim on serialization.
+    /// `data` holds the complete section bytes including signature.
+    Raw { data: Vec<u8> },
 }
 
 #[derive(Debug, Clone)]
@@ -159,54 +167,87 @@ pub(crate) enum MsdhContent {
     Unknown(Vec<u8>),
 }
 
-impl ParsedLibrary {
-    /// Reassign section ranges so the first section of each collection type
-    /// owns all items and subsequent sections of the same type are empty.
-    /// Must be called before serialization if items have been added/removed
-    /// through the public mutable accessors.
-    pub(crate) fn reindex(&mut self) {
-        let mut track_assigned = false;
-        let mut album_assigned = false;
-        let mut artist_assigned = false;
-        let mut playlist_assigned = false;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SectionKind {
+    Track,
+    Album,
+    Artist,
+    Playlist,
+}
 
-        for section in &mut self.section_order {
-            let SectionRef::Msdh { content, .. } = section;
-            match content {
-                MsdhContent::TrackList { range, .. } => {
-                    if !track_assigned {
-                        *range = 0..self.tracks.len();
-                        track_assigned = true;
-                    } else {
-                        *range = 0..0;
+impl ParsedLibrary {
+    /// Bring section ranges back in step with the item collections after
+    /// mutation through the public accessors.
+    ///
+    /// For each collection kind whose existing ranges still form an exact
+    /// in-order partition of the collection (the case after field-only
+    /// edits), the ranges are left untouched so original section
+    /// membership survives. Only when a partition is broken (items added
+    /// or removed) is that kind consolidated: the first section of the
+    /// kind takes all items and subsequent sections become empty.
+    pub(crate) fn reindex(&mut self) {
+        use SectionKind::*;
+        for kind in [Track, Album, Artist, Playlist] {
+            let len = match kind {
+                Track => self.tracks.len(),
+                Album => self.albums.len(),
+                Artist => self.artists.len(),
+                Playlist => self.playlists.len(),
+            };
+
+            // Check whether the current ranges, in section order, still
+            // exactly cover 0..len without gaps or overlap.
+            let mut expected_start = 0usize;
+            let mut intact = true;
+            for section in &self.section_order {
+                if let Some(range) = Self::kind_range(section, kind) {
+                    if range.start != expected_start {
+                        intact = false;
+                        break;
                     }
+                    expected_start = range.end;
                 }
-                MsdhContent::AlbumList { range, .. } => {
-                    if !album_assigned {
-                        *range = 0..self.albums.len();
-                        album_assigned = true;
-                    } else {
-                        *range = 0..0;
-                    }
-                }
-                MsdhContent::ArtistList { range, .. } => {
-                    if !artist_assigned {
-                        *range = 0..self.artists.len();
-                        artist_assigned = true;
-                    } else {
-                        *range = 0..0;
-                    }
-                }
-                MsdhContent::PlaylistList { range, .. } => {
-                    if !playlist_assigned {
-                        *range = 0..self.playlists.len();
-                        playlist_assigned = true;
-                    } else {
-                        *range = 0..0;
-                    }
-                }
-                _ => {}
             }
+            if intact && expected_start == len {
+                continue;
+            }
+
+            let mut assigned = false;
+            for section in &mut self.section_order {
+                if let Some(range) = Self::kind_range_mut(section, kind) {
+                    *range = if assigned { 0..0 } else { 0..len };
+                    assigned = true;
+                }
+            }
+        }
+    }
+
+    fn kind_range(section: &SectionRef, kind: SectionKind) -> Option<&std::ops::Range<usize>> {
+        let SectionRef::Msdh { content, .. } = section else {
+            return None;
+        };
+        match (content, kind) {
+            (MsdhContent::TrackList { range, .. }, SectionKind::Track)
+            | (MsdhContent::AlbumList { range, .. }, SectionKind::Album)
+            | (MsdhContent::ArtistList { range, .. }, SectionKind::Artist)
+            | (MsdhContent::PlaylistList { range, .. }, SectionKind::Playlist) => Some(range),
+            _ => None,
+        }
+    }
+
+    fn kind_range_mut(
+        section: &mut SectionRef,
+        kind: SectionKind,
+    ) -> Option<&mut std::ops::Range<usize>> {
+        let SectionRef::Msdh { content, .. } = section else {
+            return None;
+        };
+        match (content, kind) {
+            (MsdhContent::TrackList { range, .. }, SectionKind::Track)
+            | (MsdhContent::AlbumList { range, .. }, SectionKind::Album)
+            | (MsdhContent::ArtistList { range, .. }, SectionKind::Artist)
+            | (MsdhContent::PlaylistList { range, .. }, SectionKind::Playlist) => Some(range),
+            _ => None,
         }
     }
 }
@@ -220,7 +261,6 @@ pub fn parse_inner(data: &[u8]) -> Result<ParsedLibrary> {
         albums: Vec::new(),
         artists: Vec::new(),
         playlists: Vec::new(),
-        raw_sections: Vec::new(),
         section_order: Vec::new(),
     };
 
@@ -245,8 +285,7 @@ pub fn parse_inner(data: &[u8]) -> Result<ParsedLibrary> {
                     } else {
                         break;
                     }
-                    library.raw_sections.push(RawSection {
-                        sig,
+                    library.section_order.push(SectionRef::Raw {
                         data: cursor.slice_from(section_start).to_vec(),
                     });
                 } else {
@@ -264,29 +303,55 @@ fn parse_msdh(cursor: &mut Cursor, msdh_start: usize, library: &mut ParsedLibrar
     let assoc_length = cursor.read_u32_le()? as usize;
     let subtype = cursor.read_u32_le()?;
 
+    // Both lengths come from the file; validate before slicing so corrupt
+    // input surfaces as Err instead of a panic or a desynced cursor.
+    if section_length < 16 || msdh_start + section_length > cursor.data.len() {
+        return Err(ItlError::Parse {
+            offset: msdh_start,
+            message: format!("invalid msdh section length {section_length}"),
+        });
+    }
+    let content_end = msdh_start + assoc_length;
+    if assoc_length < section_length || content_end > cursor.data.len() {
+        return Err(ItlError::Parse {
+            offset: msdh_start,
+            message: format!("invalid msdh associated length {assoc_length}"),
+        });
+    }
+
     let msdh_header_bytes = cursor.data[msdh_start..msdh_start + section_length].to_vec();
 
     // Skip to end of msdh header
     let remaining_header = section_length.saturating_sub(16);
     cursor.skip(remaining_header)?;
 
-    let content_end = msdh_start + assoc_length;
-
     if msdh_is_raw_data_subtype(subtype) {
         let blob_size = content_end.saturating_sub(cursor.pos());
-        let blob = if blob_size > 0 && blob_size <= cursor.remaining() {
-            cursor.read_bytes(blob_size)?.to_vec()
-        } else {
-            Vec::new()
-        };
+        let blob = cursor.read_bytes(blob_size)?.to_vec();
         library.section_order.push(SectionRef::Msdh {
             raw_header: msdh_header_bytes,
             subtype,
             content: MsdhContent::RawBlob(blob),
         });
-        return Ok(());
+    } else {
+        parse_msdh_content(cursor, msdh_header_bytes, subtype, content_end, library)?;
     }
 
+    // Ensure cursor is at content_end
+    if cursor.pos() < content_end {
+        cursor.set_pos(content_end);
+    }
+
+    Ok(())
+}
+
+fn parse_msdh_content(
+    cursor: &mut Cursor,
+    msdh_header_bytes: Vec<u8>,
+    subtype: u32,
+    content_end: usize,
+    library: &mut ParsedLibrary,
+) -> Result<()> {
     match subtype {
         // mfdh inner header
         16 => {
@@ -390,22 +455,15 @@ fn parse_msdh(cursor: &mut Cursor, msdh_start: usize, library: &mut ParsedLibrar
             });
         }
         _ => {
-            // Skip unknown msdh content
+            // Preserve unknown msdh content verbatim
             let skip = content_end.saturating_sub(cursor.pos());
-            if skip <= cursor.remaining() {
-                let blob = cursor.read_bytes(skip)?.to_vec();
-                library.section_order.push(SectionRef::Msdh {
-                    raw_header: msdh_header_bytes,
-                    subtype,
-                    content: MsdhContent::Unknown(blob),
-                });
-            }
+            let blob = cursor.read_bytes(skip)?.to_vec();
+            library.section_order.push(SectionRef::Msdh {
+                raw_header: msdh_header_bytes,
+                subtype,
+                content: MsdhContent::Unknown(blob),
+            });
         }
-    }
-
-    // Ensure cursor is at content_end
-    if cursor.pos() < content_end && content_end <= cursor.data.len() {
-        cursor.set_pos(content_end);
     }
 
     Ok(())
@@ -485,15 +543,8 @@ pub(crate) fn parse_track_item(cursor: &mut Cursor) -> Result<Track> {
         });
     }
 
-    let section_length = cursor.read_u32_le()? as usize;
-    let assoc_length = cursor.read_u32_le()? as usize;
-    let mhoh_count = cursor.read_u32_le()?;
+    let (raw_header, mhoh_count, item_end) = read_item_header(cursor, start)?;
 
-    let header_remaining = section_length.saturating_sub(16);
-    cursor.skip(header_remaining)?;
-    let raw_header = cursor.data[start + 8..start + section_length].to_vec();
-
-    let item_end = start + assoc_length;
     let mut data_fields = Vec::new();
     for _ in 0..mhoh_count {
         if cursor.remaining() < 8 || cursor.pos() >= item_end {
@@ -515,6 +566,29 @@ pub(crate) fn parse_track_item(cursor: &mut Cursor) -> Result<Track> {
     })
 }
 
+/// Shared header reader for mith/miah/miih item sections: validates the
+/// file-supplied lengths before slicing, positions the cursor at the end
+/// of the header, and returns (raw_header, mhoh_count, item_end).
+/// `raw_header` covers section bytes 8..section_length (assoc_length,
+/// mhoh_count, id, ...).
+fn read_item_header(cursor: &mut Cursor, start: usize) -> Result<(Vec<u8>, u32, usize)> {
+    let section_length = cursor.read_u32_le()? as usize;
+    let assoc_length = cursor.read_u32_le()? as usize;
+    let mhoh_count = cursor.read_u32_le()?;
+
+    if section_length < 16 || start + section_length > cursor.data.len() {
+        return Err(ItlError::Parse {
+            offset: start,
+            message: format!("invalid item section length {section_length}"),
+        });
+    }
+
+    let header_remaining = section_length.saturating_sub(16);
+    cursor.skip(header_remaining)?;
+    let raw_header = cursor.data[start + 8..start + section_length].to_vec();
+    Ok((raw_header, mhoh_count, start + assoc_length))
+}
+
 pub(crate) fn parse_album_item(cursor: &mut Cursor) -> Result<Album> {
     let start = cursor.pos();
     let sig = cursor.read_sig()?;
@@ -525,15 +599,8 @@ pub(crate) fn parse_album_item(cursor: &mut Cursor) -> Result<Album> {
         });
     }
 
-    let section_length = cursor.read_u32_le()? as usize;
-    let assoc_length = cursor.read_u32_le()? as usize;
-    let mhoh_count = cursor.read_u32_le()?;
+    let (raw_header, mhoh_count, item_end) = read_item_header(cursor, start)?;
 
-    let header_remaining = section_length.saturating_sub(16);
-    cursor.skip(header_remaining)?;
-    let raw_header = cursor.data[start + 8..start + section_length].to_vec();
-
-    let item_end = start + assoc_length;
     let mut data_fields = Vec::new();
     for _ in 0..mhoh_count {
         if cursor.remaining() < 8 || cursor.pos() >= item_end {
@@ -565,15 +632,8 @@ pub(crate) fn parse_artist_item(cursor: &mut Cursor) -> Result<Artist> {
         });
     }
 
-    let section_length = cursor.read_u32_le()? as usize;
-    let assoc_length = cursor.read_u32_le()? as usize;
-    let mhoh_count = cursor.read_u32_le()?;
+    let (raw_header, mhoh_count, item_end) = read_item_header(cursor, start)?;
 
-    let header_remaining = section_length.saturating_sub(16);
-    cursor.skip(header_remaining)?;
-    let raw_header = cursor.data[start + 8..start + section_length].to_vec();
-
-    let item_end = start + assoc_length;
     let mut data_fields = Vec::new();
     for _ in 0..mhoh_count {
         if cursor.remaining() < 8 || cursor.pos() >= item_end {
@@ -612,17 +672,24 @@ fn parse_playlists(
                 current_playlist = Some(parse_playlist_header(cursor)?);
             }
             b"mtph" => {
-                let track_id = parse_playlist_track(cursor)?;
+                let (track_id, raw_entry) = parse_playlist_track(cursor)?;
                 if let Some(ref mut pl) = current_playlist {
-                    pl.track_ids.push(track_id);
+                    pl.entries.push(PlaylistEntry {
+                        track_id,
+                        raw: Some(raw_entry),
+                    });
                 }
             }
             b"mhoh" => {
-                if let Ok(field) = parse_mhoh(cursor)
-                    && let Some(ref mut pl) = current_playlist
-                {
-                    pl.data_fields.push(field);
-                }
+                let field = parse_mhoh(cursor)?;
+                let Some(ref mut pl) = current_playlist else {
+                    return Err(ItlError::Parse {
+                        offset: cursor.pos(),
+                        message: "mhoh data field before first miph in playlist section"
+                            .to_string(),
+                    });
+                };
+                pl.data_fields.push(field);
             }
             _ => {
                 // Unknown section inside playlist area — skip by length
@@ -660,6 +727,12 @@ fn parse_playlist_header(cursor: &mut Cursor) -> Result<Playlist> {
     }
 
     let section_length = cursor.read_u32_le()? as usize;
+    if section_length < 8 || start + section_length > cursor.data.len() {
+        return Err(ItlError::Parse {
+            offset: start,
+            message: format!("invalid miph section length {section_length}"),
+        });
+    }
     let header_remaining = section_length.saturating_sub(8);
     cursor.skip(header_remaining)?;
     let raw_header = cursor.data[start + 8..start + section_length].to_vec();
@@ -667,11 +740,13 @@ fn parse_playlist_header(cursor: &mut Cursor) -> Result<Playlist> {
     Ok(Playlist {
         raw_header,
         data_fields: Vec::new(),
-        track_ids: Vec::new(),
+        entries: Vec::new(),
     })
 }
 
-pub(crate) fn parse_playlist_track(cursor: &mut Cursor) -> Result<u32> {
+/// Parse an mtph playlist entry, returning the referenced track ID and the
+/// complete section bytes (signature included) for verbatim re-emission.
+pub(crate) fn parse_playlist_track(cursor: &mut Cursor) -> Result<(u32, Vec<u8>)> {
     let start = cursor.pos();
     let sig = cursor.read_sig()?;
     if &sig != b"mtph" {
@@ -686,16 +761,18 @@ pub(crate) fn parse_playlist_track(cursor: &mut Cursor) -> Result<u32> {
     // Track reference key is at offset 28 relative to section start (offset 20 in remaining data)
     let data_start = cursor.pos();
     let remaining_data = section_length.saturating_sub(8);
-    if remaining_data >= 20 {
+    let key = if remaining_data >= 20 {
         cursor.skip(16)?;
         let key = cursor.read_u32_le()?;
         let leftover = remaining_data.saturating_sub(20);
         cursor.skip(leftover)?;
-        Ok(key)
+        key
     } else {
-        cursor.set_pos(data_start + remaining_data);
-        Ok(0)
-    }
+        let end = (data_start + remaining_data).min(cursor.data.len());
+        cursor.set_pos(end);
+        0
+    };
+    Ok((key, cursor.slice_from(start).to_vec()))
 }
 
 pub(crate) fn parse_mhoh(cursor: &mut Cursor) -> Result<DataField> {
@@ -737,6 +814,7 @@ pub(crate) fn parse_mhoh(cursor: &mut Cursor) -> Result<DataField> {
 
     // Flex character container: string header at offsets 24-39, string at 40+
     if data_size >= 16 {
+        let data_start = cursor.pos();
         let string_type_val = cursor.read_u32_le()?;
         let string_length = cursor.read_u32_le()? as usize;
         let _padding = cursor.read_bytes(8)?;
@@ -754,20 +832,25 @@ pub(crate) fn parse_mhoh(cursor: &mut Cursor) -> Result<DataField> {
             cursor.skip(trailing)?;
         }
 
-        let encoding = StringEncoding::try_from(string_type_val).unwrap_or(StringEncoding::Utf8);
-        let value = decode_string(encoding, string_bytes);
+        // An unknown encoding tag, or bytes the claimed encoding can't
+        // decode, must not be coerced: preserve the whole data segment
+        // verbatim so serialization is byte-identical.
+        let decoded = StringEncoding::try_from(string_type_val)
+            .ok()
+            .and_then(|encoding| decode_string(encoding, string_bytes).map(|v| (encoding, v)));
+
+        let content = match decoded {
+            Some((encoding, value)) => DataContent::String { encoding, value },
+            None => DataContent::UnknownString(cursor.data[data_start..cursor.pos()].to_vec()),
+        };
 
         Ok(DataField {
             raw_header,
             subtype,
-            content: DataContent::String { encoding, value },
+            content,
         })
     } else {
-        let data = if data_size > 0 && data_size <= cursor.remaining() {
-            cursor.read_bytes(data_size)?.to_vec()
-        } else {
-            Vec::new()
-        };
+        let data = cursor.read_bytes(data_size.min(cursor.remaining()))?.to_vec();
         Ok(DataField {
             raw_header,
             subtype,
@@ -776,21 +859,20 @@ pub(crate) fn parse_mhoh(cursor: &mut Cursor) -> Result<DataField> {
     }
 }
 
-fn decode_string(encoding: StringEncoding, bytes: &[u8]) -> String {
+fn decode_string(encoding: StringEncoding, bytes: &[u8]) -> Option<String> {
     match encoding {
         StringEncoding::Utf8 | StringEncoding::Uri | StringEncoding::EscapedUri => {
-            String::from_utf8_lossy(bytes).into_owned()
+            std::str::from_utf8(bytes).ok().map(str::to_owned)
         }
         StringEncoding::Utf16 => {
-            if bytes.len() >= 2 {
-                let u16s: Vec<u16> = bytes
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                String::from_utf16_lossy(&u16s)
-            } else {
-                String::from_utf8_lossy(bytes).into_owned()
+            if !bytes.len().is_multiple_of(2) {
+                return None;
             }
+            let u16s: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16(&u16s).ok()
         }
     }
 }
@@ -1144,32 +1226,65 @@ mod tests {
     #[test]
     fn test_decode_string_utf8() {
         let s = super::decode_string(StringEncoding::Utf8, b"hello \xC3\xBC");
-        assert_eq!(s, "hello ü");
+        assert_eq!(s.as_deref(), Some("hello ü"));
     }
 
     #[test]
     fn test_decode_string_utf16() {
         let bytes = [0x41u8, 0x00, 0x42u8, 0x00];
         let s = super::decode_string(StringEncoding::Utf16, &bytes);
-        assert_eq!(s, "AB");
+        assert_eq!(s.as_deref(), Some("AB"));
     }
 
     #[test]
-    fn test_decode_string_utf16_single_byte() {
-        let s = super::decode_string(StringEncoding::Utf16, &[0x41u8]);
-        assert_eq!(s, "A");
+    fn test_decode_string_utf16_odd_length_is_rejected() {
+        // Odd-length UTF-16 is undecodable; the caller preserves the raw
+        // bytes instead of mangling them.
+        assert_eq!(super::decode_string(StringEncoding::Utf16, &[0x41u8]), None);
+    }
+
+    #[test]
+    fn test_decode_string_invalid_utf8_is_rejected() {
+        assert_eq!(
+            super::decode_string(StringEncoding::Utf8, &[0xFFu8, 0xFE]),
+            None
+        );
     }
 
     #[test]
     fn test_decode_string_uri() {
         let s = super::decode_string(StringEncoding::Uri, b"file:///music/a.flac");
-        assert_eq!(s, "file:///music/a.flac");
+        assert_eq!(s.as_deref(), Some("file:///music/a.flac"));
     }
 
     #[test]
     fn test_decode_string_escaped_uri() {
         let s = super::decode_string(StringEncoding::EscapedUri, b"path%20here");
-        assert_eq!(s, "path%20here");
+        assert_eq!(s.as_deref(), Some("path%20here"));
+    }
+
+    #[test]
+    fn test_parse_mhoh_unknown_encoding_preserved_as_raw() {
+        // Encoding tag 99 is unknown: the field must keep the whole data
+        // segment verbatim instead of coercing to UTF-8, and must not
+        // leak the header bytes through as_str().
+        let buf = build_mhoh_flex(DataFieldType::TrackTitle as u32, 99, b"payload");
+        let mut c = Cursor::new(&buf);
+        let field = super::parse_mhoh(&mut c).unwrap();
+        match &field.content {
+            DataContent::UnknownString(d) => {
+                assert_eq!(d.len(), 16 + 7, "string header + payload preserved");
+                assert_eq!(&d[0..4], &99u32.to_le_bytes());
+                assert_eq!(&d[16..], b"payload");
+            }
+            other => panic!("expected UnknownString, got {other:?}"),
+        }
+        assert_eq!(
+            field.as_str(),
+            None,
+            "undecodable segment must not surface as mangled text"
+        );
+        assert_eq!(c.pos(), buf.len());
     }
 
     #[test]
@@ -1247,7 +1362,7 @@ mod tests {
         let buf = build_miph();
         let mut c = Cursor::new(&buf);
         let pl = super::parse_playlist_header(&mut c).unwrap();
-        assert_eq!(pl.track_ids.len(), 0);
+        assert_eq!(pl.entries.len(), 0);
         assert!(pl.data_fields.is_empty());
     }
 
@@ -1264,13 +1379,15 @@ mod tests {
     fn test_parse_playlist_track() {
         let buf = build_mtph(99);
         let mut c = Cursor::new(&buf);
-        let id = super::parse_playlist_track(&mut c).unwrap();
+        let (id, raw) = super::parse_playlist_track(&mut c).unwrap();
         assert_eq!(id, 99);
+        assert_eq!(raw, buf, "full mtph section preserved");
 
         let short = build_mtph_short();
         let mut c2 = Cursor::new(&short);
-        let id0 = super::parse_playlist_track(&mut c2).unwrap();
+        let (id0, raw0) = super::parse_playlist_track(&mut c2).unwrap();
         assert_eq!(id0, 0);
+        assert_eq!(raw0, short);
     }
 
     #[test]
@@ -1348,7 +1465,7 @@ mod tests {
         assert!(lib.albums.is_empty());
         assert!(lib.artists.is_empty());
         assert!(lib.playlists.is_empty());
-        assert!(lib.raw_sections.is_empty());
+        assert!(lib.section_order.is_empty());
         assert!(lib.inner_header.is_none());
         assert!(lib.library_info.is_none());
     }
@@ -1447,9 +1564,14 @@ mod tests {
         junk.extend_from_slice(&16u32.to_le_bytes());
         junk.extend_from_slice(&[0u8; 8]);
         let lib = parse_inner(&junk).unwrap();
-        assert_eq!(lib.raw_sections.len(), 1);
-        assert_eq!(lib.raw_sections[0].sig, *b"zzzz");
-        assert_eq!(lib.raw_sections[0].data.len(), 16);
+        assert_eq!(lib.section_order.len(), 1);
+        match &lib.section_order[0] {
+            SectionRef::Raw { data } => {
+                assert_eq!(&data[0..4], b"zzzz");
+                assert_eq!(data.len(), 16);
+            }
+            other => panic!("expected SectionRef::Raw, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1492,7 +1614,6 @@ mod tests {
             albums: Vec::new(),
             artists: Vec::new(),
             playlists: Vec::new(),
-            raw_sections: Vec::new(),
             section_order: Vec::new(),
         };
         let end = c.data.len();
@@ -1660,7 +1781,6 @@ mod tests {
             albums: Vec::new(),
             artists: Vec::new(),
             playlists: Vec::new(),
-            raw_sections: Vec::new(),
             section_order: Vec::new(),
         };
         super::parse_playlists(&mut c, blob.len(), &mut lib).unwrap();
@@ -1741,7 +1861,158 @@ mod tests {
     fn test_parse_playlist_track_short_section() {
         let data = build_mtph_short();
         let mut c = Cursor::new(&data);
-        let id = super::parse_playlist_track(&mut c).unwrap();
+        let (id, _) = super::parse_playlist_track(&mut c).unwrap();
         assert_eq!(id, 0);
+    }
+
+    #[test]
+    fn test_parse_msdh_oversized_section_length_errors() {
+        // section_length = u32::MAX must surface as Err, not a panic.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"msdh");
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        buf.extend_from_slice(&96u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 96]);
+        let err = parse_inner(&buf).unwrap_err();
+        assert!(matches!(err, ItlError::Parse { .. }));
+    }
+
+    #[test]
+    fn test_parse_msdh_zero_section_length_errors() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"msdh");
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&96u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 96]);
+        let err = parse_inner(&buf).unwrap_err();
+        assert!(matches!(err, ItlError::Parse { .. }));
+    }
+
+    #[test]
+    fn test_parse_msdh_truncated_assoc_length_errors() {
+        // assoc_length pointing past the end of the data must error rather
+        // than silently swallowing the truncated blob.
+        let section_length: u32 = 96;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"msdh");
+        buf.extend_from_slice(&section_length.to_le_bytes());
+        buf.extend_from_slice(&(section_length + 1000).to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes()); // raw data subtype
+        buf.extend_from_slice(&vec![0u8; section_length as usize - 16]);
+        buf.extend_from_slice(&[0u8; 10]); // far less than the claimed 1000
+        let err = parse_inner(&buf).unwrap_err();
+        assert!(matches!(err, ItlError::Parse { .. }));
+    }
+
+    #[test]
+    fn test_parse_track_item_tiny_section_length_errors() {
+        // section_length < 16 used to build an inverted slice range and panic.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"mith");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 32]);
+        let mut c = Cursor::new(&buf);
+        let err = super::parse_track_item(&mut c).unwrap_err();
+        assert!(matches!(err, ItlError::Parse { .. }));
+    }
+
+    #[test]
+    fn test_parse_playlist_header_tiny_section_length_errors() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"miph");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 32]);
+        let mut c = Cursor::new(&buf);
+        let err = super::parse_playlist_header(&mut c).unwrap_err();
+        assert!(matches!(err, ItlError::Parse { .. }));
+    }
+
+    #[test]
+    fn test_parse_playlists_orphan_mhoh_errors() {
+        // An mhoh before any miph would previously be parsed and dropped.
+        let title = build_mhoh_flex(
+            DataFieldType::PlaylistTitle as u32,
+            StringEncoding::Utf8 as u32,
+            b"Orphan",
+        );
+        let blob = [title.as_slice(), build_miph().as_slice()].concat();
+        let mut c = Cursor::new(&blob);
+        let mut lib = ParsedLibrary {
+            inner_header: None,
+            library_info: None,
+            tracks: Vec::new(),
+            albums: Vec::new(),
+            artists: Vec::new(),
+            playlists: Vec::new(),
+            section_order: Vec::new(),
+        };
+        let err = super::parse_playlists(&mut c, blob.len(), &mut lib).unwrap_err();
+        assert!(matches!(err, ItlError::Parse { .. }));
+    }
+
+    #[test]
+    fn test_msdh_raw_subtypes_against_fixture() {
+        // Tie the raw-subtype set to a real library: every msdh subtype in
+        // the fixture must either be in the raw set or contain a known
+        // master signature right after its header.
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini.itl");
+        let Ok(raw) = std::fs::read(&path) else {
+            eprintln!("skipping: tests/fixtures/mini.itl not present");
+            return;
+        };
+        let header = crate::header::EnvelopeHeader::parse(&raw).unwrap();
+        let payload =
+            crate::crypto::decrypt_payload(&raw[crate::header::ENVELOPE_LENGTH..], header.max_crypt_size())
+                .unwrap();
+
+        let mut c = Cursor::new(&payload);
+        let mut checked = 0usize;
+        while c.remaining() >= 16 {
+            let start = c.pos();
+            let sig = c.read_sig().unwrap();
+            if &sig != b"msdh" {
+                break;
+            }
+            let section_length = c.read_u32_le().unwrap() as usize;
+            let assoc_length = c.read_u32_le().unwrap() as usize;
+            let subtype = c.read_u32_le().unwrap();
+            c.set_pos(start + section_length);
+            let next_sig = c.peek_bytes(4).unwrap();
+            // Subtypes this crate parses must contain their master
+            // signature; subtypes in the raw set must NOT start with a
+            // known master signature (they hold opaque blobs). Anything
+            // else (e.g. subtype 20 = mlqh) is preserved as Unknown.
+            let expected: Option<&[u8; 4]> = match subtype {
+                16 => Some(b"mfdh"),
+                12 => Some(b"mhgh"),
+                1 | 13 => Some(b"mlth"),
+                9 => Some(b"mlah"),
+                11 => Some(b"mlih"),
+                2 | 14 => Some(b"mlph"),
+                _ => None,
+            };
+            if let Some(sig) = expected {
+                assert_eq!(
+                    next_sig, sig,
+                    "msdh subtype {subtype} should contain {sig:?}"
+                );
+            } else if super::msdh_is_raw_data_subtype(subtype) {
+                assert!(
+                    !matches!(
+                        next_sig,
+                        b"mfdh" | b"mhgh" | b"mlth" | b"mlah" | b"mlih" | b"mlph"
+                    ),
+                    "raw msdh subtype {subtype} unexpectedly contains master sig {next_sig:?}"
+                );
+            }
+            checked += 1;
+            c.set_pos(start + assoc_length);
+        }
+        assert!(checked > 0, "fixture contained no msdh sections");
     }
 }

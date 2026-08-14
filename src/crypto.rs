@@ -17,13 +17,16 @@ pub fn decrypt_payload(encrypted: &[u8], max_crypt_size: u32) -> Result<Vec<u8>>
 
     let cipher = Aes128::new(GenericArray::from_slice(AES_KEY));
 
-    let mut buf = encrypted.to_vec();
-    for chunk in buf[..crypt_size].chunks_exact_mut(BLOCK_SIZE) {
+    // Only the first crypt_size bytes are encrypted; decrypt those into a
+    // small buffer and chain the untouched remainder instead of copying the
+    // whole (potentially tens-of-MB) payload.
+    let mut prefix = encrypted[..crypt_size].to_vec();
+    for chunk in prefix.chunks_exact_mut(BLOCK_SIZE) {
         cipher.decrypt_block(GenericArray::from_mut_slice(chunk));
     }
 
-    let mut decompressed = Vec::new();
-    let mut decoder = ZlibDecoder::new(&buf[..]);
+    let mut decompressed = Vec::with_capacity(payload_len.saturating_mul(4));
+    let mut decoder = ZlibDecoder::new(prefix.as_slice().chain(&encrypted[crypt_size..]));
     decoder
         .read_to_end(&mut decompressed)
         .map_err(|e| ItlError::Decompression(e.to_string()))?;

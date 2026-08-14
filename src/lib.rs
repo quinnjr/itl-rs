@@ -48,6 +48,10 @@ use std::path::Path;
 pub struct ItlFile {
     header: EnvelopeHeader,
     library: ParsedLibrary,
+    /// Set when a mutable collection accessor has been handed out;
+    /// `to_bytes` reindexes sections only in that case, so a pure
+    /// read→save round trip preserves original section membership.
+    dirty: bool,
 }
 
 impl ItlFile {
@@ -63,7 +67,11 @@ impl ItlFile {
         let payload = &raw[ENVELOPE_LENGTH..];
         let decompressed = crypto::decrypt_payload(payload, header.max_crypt_size())?;
         let library = parse::parse_inner(&decompressed)?;
-        Ok(Self { header, library })
+        Ok(Self {
+            header,
+            library,
+            dirty: false,
+        })
     }
 
     /// Write the library back to a file.
@@ -75,7 +83,10 @@ impl ItlFile {
 
     /// Serialize the library to raw ITL bytes.
     pub fn to_bytes(&mut self) -> Result<Vec<u8>> {
-        self.library.reindex();
+        if self.dirty {
+            self.library.reindex();
+            self.dirty = false;
+        }
         let inner = write::serialize_inner(&self.library)?;
         let encrypted = crypto::encrypt_payload(&inner, self.header.max_crypt_size())?;
 
@@ -125,6 +136,7 @@ impl ItlFile {
 
     /// Mutable access to all tracks.
     pub fn tracks_mut(&mut self) -> &mut Vec<Track> {
+        self.dirty = true;
         &mut self.library.tracks
     }
 
@@ -135,6 +147,7 @@ impl ItlFile {
 
     /// Mutable access to all playlists.
     pub fn playlists_mut(&mut self) -> &mut Vec<Playlist> {
+        self.dirty = true;
         &mut self.library.playlists
     }
 
@@ -145,6 +158,7 @@ impl ItlFile {
 
     /// Mutable access to all albums.
     pub fn albums_mut(&mut self) -> &mut Vec<Album> {
+        self.dirty = true;
         &mut self.library.albums
     }
 
@@ -155,6 +169,7 @@ impl ItlFile {
 
     /// Mutable access to all artists.
     pub fn artists_mut(&mut self) -> &mut Vec<Artist> {
+        self.dirty = true;
         &mut self.library.artists
     }
 
@@ -165,15 +180,45 @@ impl ItlFile {
 
     /// Find a track by its short ID (mutable).
     pub fn track_by_id_mut(&mut self, id: u32) -> Option<&mut Track> {
+        // Same contract as the *_mut collection accessors: any handed-out
+        // mutable access marks the library dirty. reindex() is a no-op
+        // when section membership is still intact, so this is cheap.
+        self.dirty = true;
         self.library.tracks.iter_mut().find(|t| t.id() == id)
     }
 
     /// Resolve a playlist's track IDs into track references.
     pub fn playlist_tracks(&self, playlist: &Playlist) -> Vec<&Track> {
+        // One O(n) index build instead of a linear scan per entry; first
+        // occurrence wins, matching track_by_id.
+        let mut index = std::collections::HashMap::with_capacity(self.library.tracks.len());
+        for track in &self.library.tracks {
+            index.entry(track.id()).or_insert(track);
+        }
         playlist
             .track_ids()
             .iter()
-            .filter_map(|&id| self.track_by_id(id))
+            .filter_map(|id| index.get(id).copied())
+            .collect()
+    }
+
+    /// Unparsed non-msdh top-level sections, preserved verbatim through
+    /// a read→save round trip. Derived from the serialization order, the
+    /// single owner of the bytes.
+    pub fn raw_sections(&self) -> Vec<RawSection> {
+        self.library
+            .section_order
+            .iter()
+            .filter_map(|s| match s {
+                parse::SectionRef::Raw { data } => Some(RawSection {
+                    sig: data
+                        .get(0..4)
+                        .and_then(|s| s.try_into().ok())
+                        .unwrap_or(*b"????"),
+                    data: data.clone(),
+                }),
+                _ => None,
+            })
             .collect()
     }
 
@@ -331,7 +376,10 @@ mod tests {
                     value: "Test PL".to_string(),
                 },
             }],
-            track_ids: vec![42],
+            entries: vec![types::PlaylistEntry {
+                track_id: 42,
+                raw: None,
+            }],
         });
         assert_eq!(lib.playlists().len(), 1);
         assert_eq!(lib.playlists()[0].title(), Some("Test PL"));
@@ -354,6 +402,121 @@ mod tests {
             data_fields: vec![],
         });
         assert_eq!(lib.artists().len(), 1);
+    }
+
+    fn build_itl_with_payload(inner_data: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 0x90];
+        header[0..4].copy_from_slice(b"hdfm");
+        header[4..8].copy_from_slice(&0x90u32.to_be_bytes());
+        header[92..96].copy_from_slice(&1024u32.to_be_bytes());
+        header[16] = 5;
+        header[17..22].copy_from_slice(b"1.0.0");
+        let encrypted = crypto::encrypt_payload(inner_data, 1024).unwrap();
+        let file_len = 0x90 + encrypted.len();
+        header[8..12].copy_from_slice(&(file_len as u32).to_be_bytes());
+        let mut file = Vec::new();
+        file.extend_from_slice(&header);
+        file.extend_from_slice(&encrypted);
+        file
+    }
+
+    #[test]
+    fn test_unknown_toplevel_section_survives_round_trip() {
+        // A non-msdh top-level section must be preserved byte-for-byte
+        // through open → save.
+        let mut inner = Vec::new();
+        inner.extend_from_slice(b"zzzz");
+        inner.extend_from_slice(&16u32.to_le_bytes());
+        inner.extend_from_slice(&[0xEE; 8]);
+
+        let data = build_itl_with_payload(&inner);
+        let mut lib = ItlFile::from_bytes(&data).unwrap();
+        assert_eq!(lib.raw_sections().len(), 1);
+        assert_eq!(lib.raw_sections()[0].sig, *b"zzzz");
+
+        let bytes = lib.to_bytes().unwrap();
+        let lib2 = ItlFile::from_bytes(&bytes).unwrap();
+        assert_eq!(lib2.raw_sections().len(), 1);
+        assert_eq!(lib2.raw_sections()[0].data, lib.raw_sections()[0].data);
+    }
+
+    #[test]
+    fn test_pure_round_trip_preserves_section_membership() {
+        // Two track-list sections with one track each: an unmutated
+        // open → to_bytes must NOT merge them into the first section.
+        fn build_mlth_msdh(track_id: u32, subtype: u32) -> Vec<u8> {
+            let mut mith = Vec::new();
+            mith.extend_from_slice(b"mith");
+            let section_length = 16 + 184u32;
+            mith.extend_from_slice(&section_length.to_le_bytes());
+            mith.extend_from_slice(&section_length.to_le_bytes()); // assoc_length, no mhohs
+            mith.extend_from_slice(&0u32.to_le_bytes()); // mhoh_count
+            let mut extra = vec![0u8; 184];
+            extra[0..4].copy_from_slice(&track_id.to_le_bytes());
+            mith.extend_from_slice(&extra);
+
+            let mut mlth = Vec::new();
+            mlth.extend_from_slice(b"mlth");
+            mlth.extend_from_slice(&92u32.to_le_bytes());
+            mlth.extend_from_slice(&1u32.to_le_bytes());
+            mlth.extend_from_slice(&[0u8; 92 - 12]);
+
+            let content_len = (mlth.len() + mith.len()) as u32;
+            let mut msdh = Vec::new();
+            msdh.extend_from_slice(b"msdh");
+            msdh.extend_from_slice(&96u32.to_le_bytes());
+            msdh.extend_from_slice(&(96 + content_len).to_le_bytes());
+            msdh.extend_from_slice(&subtype.to_le_bytes());
+            msdh.extend_from_slice(&[0u8; 96 - 16]);
+            msdh.extend_from_slice(&mlth);
+            msdh.extend_from_slice(&mith);
+            msdh
+        }
+
+        fn track_list_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+            let decompressed = crypto::decrypt_payload(&bytes[ENVELOPE_LENGTH..], 1024).unwrap();
+            let reparsed = parse::parse_inner(&decompressed).unwrap();
+            reparsed
+                .section_order
+                .iter()
+                .filter_map(|s| match s {
+                    parse::SectionRef::Msdh {
+                        content: parse::MsdhContent::TrackList { range, .. },
+                        ..
+                    } => Some(range.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let inner = [build_mlth_msdh(1, 1), build_mlth_msdh(2, 13)].concat();
+        let data = build_itl_with_payload(&inner);
+        let mut lib = ItlFile::from_bytes(&data).unwrap();
+        assert_eq!(lib.tracks().len(), 2);
+
+        // No mutation: serialize and re-inspect the inner payload.
+        let ranges = track_list_ranges(&lib.to_bytes().unwrap());
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].len(), 1, "first section must keep its one track");
+        assert_eq!(ranges[1].len(), 1, "second section must keep its one track");
+
+        // Field-only edit through tracks_mut(): membership must STILL be
+        // preserved — reindex leaves intact partitions alone.
+        lib.tracks_mut()[0].set_title("Edited");
+        let ranges = track_list_ranges(&lib.to_bytes().unwrap());
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(
+            ranges[0].len(),
+            1,
+            "field edit must not collapse section membership"
+        );
+        assert_eq!(ranges[1].len(), 1);
+
+        // After a membership mutation, reindex consolidates as documented.
+        lib.tracks_mut().remove(1);
+        let bytes = lib.to_bytes().unwrap();
+        let lib3 = ItlFile::from_bytes(&bytes).unwrap();
+        assert_eq!(lib3.tracks().len(), 1);
     }
 
     #[test]

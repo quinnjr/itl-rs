@@ -45,7 +45,7 @@ impl EnvelopeHeader {
 
     pub fn version(&self) -> &str {
         let vlen = self.raw[16] as usize;
-        let end = 17 + vlen;
+        let end = (17 + vlen).min(ENVELOPE_LENGTH);
         std::str::from_utf8(&self.raw[17..end]).unwrap_or("unknown")
     }
 
@@ -145,6 +145,16 @@ mod tests {
         assert_eq!(h.file_length(), 0x00280000);
         h.set_file_length(999);
         assert_eq!(h.file_length(), 999);
+    }
+
+    #[test]
+    fn version_oversized_length_clamps_instead_of_panicking() {
+        let mut buf = valid_header_bytes();
+        buf[16] = 200; // 17 + 200 > 144
+        let h = EnvelopeHeader::parse(&buf).unwrap();
+        // Must not panic; the clamped slice contains NUL padding, which is
+        // valid UTF-8, so we just require a non-panicking &str back.
+        let _ = h.version();
     }
 
     #[test]

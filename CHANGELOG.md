@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-08-14
+
+First stable release, following a full conformance/efficiency audit and
+an adversarially-verified code review of the entire crate.
+
+### Added
+
+- `DataContent::UnknownString` — flex-string segments with an unknown
+  encoding tag (or bytes that don't decode under the claimed encoding)
+  are preserved byte-for-byte and re-emitted verbatim on save.
+  `as_str()` returns `None` for them instead of mangled text.
+- `Playlist::remove_tracks(&HashSet<u32>)` — single-pass bulk removal.
+- `ItlFile::raw_sections()` — view of unparsed non-msdh top-level
+  sections, which now survive an open→save round trip verbatim.
+- Original `mtph` playlist-entry bytes and the unknown tail of each
+  mhoh common header are preserved through save.
+- Integration tests honor `ITL_TEST_PATH` and skip (instead of
+  panicking) when the reference library is absent; new fixture-backed
+  sanity tests for `rating`, `date_added`, and msdh subtype handling.
+
+### Changed
+
+- **Breaking**: `Playlist::track_ids()` returns `Vec<u32>` (entries are
+  now stored as internally-paired `PlaylistEntry` records).
+- **Breaking**: `ItlError::UnknownSection` and
+  `ItlError::InvalidStringEncoding` removed (never constructed).
+- `Playlist::item_count()` derives from the entry list and can no
+  longer go stale; `add_track`/`remove_track(s)` keep the on-disk
+  header field in step.
+- A pure open→save round trip no longer consolidates multi-section
+  track/playlist lists: reindexing preserves section membership unless
+  items were actually added or removed.
+- `unix_to_apple` saturates at the representable range
+  (1904-01-01..2040-02-06) instead of wrapping.
+- `mlph` playlist-list master count is patched on write like the other
+  list masters.
+- Decryption copies only the encrypted prefix of the payload instead of
+  the whole file; `playlist_tracks` resolves via an id index instead of
+  a linear scan per entry.
+
+### Fixed
+
+- All file-supplied section lengths are validated before slicing:
+  corrupt or truncated libraries now return `Err` instead of panicking
+  (msdh, mith/miah/miih, miph, envelope version string).
+- Truncated mhoh fields and blobs error instead of silently desyncing
+  the cursor and misparsing everything after them.
+- Off-by-one bounds guards in nine legacy accessors (`play_count`,
+  `rating`, `is_checked`, `date_added_raw`, `album_persistent_id`,
+  `Album::persistent_id`, `Album::rating`, `Artist::persistent_id`,
+  playlist header count) returned defaults for headers of exactly the
+  required length.
+- `dedup` example: tie-break now actually keeps the earliest copy on
+  equal play counts, the reported "keeper" is the track actually kept,
+  and removals are single-pass.
+
 ## [0.2.0] - 2026-04-29
 
 ### Added

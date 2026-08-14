@@ -22,12 +22,6 @@ pub enum ItlError {
 
     #[error("parse error at offset {offset:#x}: {message}")]
     Parse { offset: usize, message: String },
-
-    #[error("unknown section signature at offset {offset:#x}: {sig:?}")]
-    UnknownSection { offset: usize, sig: [u8; 4] },
-
-    #[error("invalid string encoding type {0}")]
-    InvalidStringEncoding(u32),
 }
 
 pub type Result<T> = std::result::Result<T, ItlError>;
