@@ -40,8 +40,7 @@ fn main() {
     );
     println!();
 
-    // Group tracks by (title, artist, album). The first occurrence in each
-    // group is the "keeper"; the rest are duplicates.
+    // Group tracks by (title, artist, album).
     let mut seen: HashMap<TrackKey, Vec<usize>> = HashMap::new();
     for (idx, track) in library.tracks().iter().enumerate() {
         let key = TrackKey {
@@ -57,7 +56,16 @@ fn main() {
     for indices in seen.values() {
         if indices.len() > 1 {
             dup_groups += 1;
-            let keeper = &library.tracks()[indices[0]];
+
+            // Keep the copy with the highest play count (prefer the one the
+            // user has interacted with the most). Break ties by lowest index
+            // (earliest added).
+            let best = *indices
+                .iter()
+                .max_by_key(|&&i| (library.tracks()[i].play_count(), std::cmp::Reverse(i)))
+                .unwrap();
+
+            let keeper = &library.tracks()[best];
             println!(
                 "duplicate group ({} copies): \"{}\" - {} [{}]",
                 indices.len(),
@@ -65,14 +73,6 @@ fn main() {
                 keeper.artist().unwrap_or("<no artist>"),
                 keeper.album().unwrap_or("<no album>"),
             );
-
-            // Keep the copy with the highest play count (prefer the one the
-            // user has interacted with the most). Break ties by lowest index
-            // (earliest added).
-            let best = *indices
-                .iter()
-                .max_by_key(|&&i| library.tracks()[i].play_count())
-                .unwrap();
 
             for &i in indices {
                 if i != best {
@@ -100,23 +100,21 @@ fn main() {
         .map(|&i| library.tracks()[i].id())
         .collect();
 
-    // Remove duplicates from the track list (iterate in reverse so indices
-    // stay valid).
-    dup_indices.sort_unstable();
-    dup_indices.dedup();
-    for &i in dup_indices.iter().rev() {
-        library.tracks_mut().remove(i);
-    }
+    // Remove duplicates from the track list in one pass.
+    let dup_set: HashSet<usize> = dup_indices.iter().copied().collect();
+    let mut idx = 0usize;
+    library.tracks_mut().retain(|_| {
+        let keep = !dup_set.contains(&idx);
+        idx += 1;
+        keep
+    });
 
-    // Scrub the removed IDs from every playlist.
+    // Scrub the removed IDs from every playlist, one pass per playlist.
     let mut playlist_fixes = 0u64;
     for playlist in library.playlists_mut() {
         let before = playlist.track_ids().len();
-        for &id in &removed_ids {
-            playlist.remove_track(id);
-        }
-        let after = playlist.track_ids().len();
-        if before != after {
+        playlist.remove_tracks(&removed_ids);
+        if playlist.track_ids().len() != before {
             playlist_fixes += 1;
         }
     }

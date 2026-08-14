@@ -111,8 +111,12 @@ fn write_section(w: &mut Writer, section_ref: &SectionRef, library: &ParsedLibra
                     raw_header: master,
                     range,
                 } => {
+                    let master_start = w.pos();
                     w.write_bytes(master);
-                    for playlist in &library.playlists[range.clone()] {
+                    let items = &library.playlists[range.clone()];
+                    let count_offset = master_start + 8;
+                    w.patch_u32_le(count_offset, items.len() as u32);
+                    for playlist in items {
                         write_playlist(w, playlist)?;
                     }
                 }
@@ -127,6 +131,9 @@ fn write_section(w: &mut Writer, section_ref: &SectionRef, library: &ParsedLibra
             // Patch the associated data length in the msdh header (offset 8 from start, LE u32)
             let total_size = (w.pos() - msdh_start) as u32;
             w.patch_u32_le(msdh_start + 8, total_size);
+        }
+        SectionRef::Raw { data } => {
+            w.write_bytes(data);
         }
     }
     Ok(())
@@ -233,9 +240,14 @@ fn write_playlist(w: &mut Writer, playlist: &Playlist) -> Result<()> {
         write_mhoh(w, field)?;
     }
 
-    // mtph track references
-    for &track_id in &playlist.track_ids {
-        write_playlist_track(w, track_id)?;
+    // mtph track references: re-emit original entry bytes when we have
+    // them (they carry per-entry state beyond the track ID); synthesize a
+    // canonical entry only for tracks added through the API.
+    for entry in &playlist.entries {
+        match &entry.raw {
+            Some(raw) => w.write_bytes(raw),
+            None => write_playlist_track(w, entry.track_id)?,
+        }
     }
 
     Ok(())
@@ -257,10 +269,16 @@ fn write_mhoh(w: &mut Writer, field: &DataField) -> Result<()> {
     let total_length_offset = w.pos();
     w.write_u32_le(0); // placeholder for total length
     w.write_u32_le(field.subtype);
-    w.write_bytes(&[0u8; 8]); // remaining common header
+    // Preserve the unknown tail of the 24-byte common header when the
+    // field came from a parsed file; zero it for synthesized fields.
+    if field.raw_header.len() == 24 {
+        w.write_bytes(&field.raw_header[16..24]);
+    } else {
+        w.write_bytes(&[0u8; 8]);
+    }
 
     match &field.content {
-        DataContent::RawData(data) => {
+        DataContent::RawData(data) | DataContent::UnknownString(data) => {
             w.write_bytes(data);
         }
         DataContent::String { encoding, value } => {
@@ -358,7 +376,13 @@ mod tests {
                 StringEncoding::Utf8,
                 title,
             )],
-            track_ids,
+            entries: track_ids
+                .into_iter()
+                .map(|track_id| PlaylistEntry {
+                    track_id,
+                    raw: None,
+                })
+                .collect(),
         }
     }
 
@@ -370,7 +394,6 @@ mod tests {
             albums: Vec::new(),
             artists: Vec::new(),
             playlists: Vec::new(),
-            raw_sections: Vec::new(),
             section_order: Vec::new(),
         }
     }
@@ -524,8 +547,117 @@ mod tests {
         write_playlist_track(&mut w, 999).unwrap();
 
         let mut cursor = parse::Cursor::new(&w.buf);
-        let id = parse::parse_playlist_track(&mut cursor).unwrap();
+        let (id, raw) = parse::parse_playlist_track(&mut cursor).unwrap();
         assert_eq!(id, 999);
+        assert_eq!(raw, w.buf);
+    }
+
+    #[test]
+    fn test_write_playlist_preserves_raw_mtph_entries() {
+        // A 36-byte mtph with nonzero trailing payload must survive
+        // write byte-for-byte; the synthesized form is 28 bytes.
+        let mut original_entry = Vec::new();
+        original_entry.extend_from_slice(b"mtph");
+        original_entry.extend_from_slice(&36u32.to_le_bytes());
+        original_entry.extend_from_slice(&[0xAB; 16]);
+        original_entry.extend_from_slice(&77u32.to_le_bytes());
+        original_entry.extend_from_slice(&[0xCD; 8]);
+
+        let mut playlist = make_playlist("PL", vec![77]);
+        playlist.entries[0].raw = Some(original_entry.clone());
+
+        let mut w = Writer::new();
+        write_playlist(&mut w, &playlist).unwrap();
+        assert!(
+            w.buf
+                .windows(original_entry.len())
+                .any(|win| win == original_entry.as_slice()),
+            "original mtph bytes must be re-emitted verbatim"
+        );
+    }
+
+    #[test]
+    fn test_serialize_playlist_list_patches_count() {
+        let master_header = {
+            let section_length: u32 = 92;
+            let mut buf = vec![0u8; section_length as usize];
+            buf[0..4].copy_from_slice(b"mlph");
+            buf[4..8].copy_from_slice(&section_length.to_le_bytes());
+            buf[8..12].copy_from_slice(&999u32.to_le_bytes()); // stale count
+            buf
+        };
+        let msdh_header = {
+            let section_length: u32 = 96;
+            let mut buf = vec![0u8; section_length as usize];
+            buf[0..4].copy_from_slice(b"msdh");
+            buf[4..8].copy_from_slice(&section_length.to_le_bytes());
+            buf[12..16].copy_from_slice(&2u32.to_le_bytes());
+            buf
+        };
+
+        let mut library = make_empty_library();
+        library.playlists.push(make_playlist("A", vec![1]));
+        library.playlists.push(make_playlist("B", vec![2]));
+        library.section_order.push(SectionRef::Msdh {
+            raw_header: msdh_header,
+            subtype: 2,
+            content: MsdhContent::PlaylistList {
+                raw_header: master_header,
+                range: 0..2,
+            },
+        });
+
+        let result = serialize_inner(&library).unwrap();
+        let master_offset = 96;
+        let count = u32::from_le_bytes(
+            result[master_offset + 8..master_offset + 12]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(count, 2, "mlph count must be patched to the real count");
+    }
+
+    #[test]
+    fn test_serialize_inner_raw_toplevel_section() {
+        let mut junk = Vec::new();
+        junk.extend_from_slice(b"zzzz");
+        junk.extend_from_slice(&16u32.to_le_bytes());
+        junk.extend_from_slice(&[0xEE; 8]);
+
+        let mut library = make_empty_library();
+        library.section_order.push(SectionRef::Raw { data: junk.clone() });
+
+        let result = serialize_inner(&library).unwrap();
+        assert_eq!(result, junk, "raw top-level section re-emitted verbatim");
+    }
+
+    #[test]
+    fn test_write_mhoh_preserves_common_header_tail() {
+        // Bytes 16..24 of a parsed mhoh header must survive write.
+        let mut raw_header = vec![0u8; 24];
+        raw_header[0..4].copy_from_slice(b"mhoh");
+        raw_header[16..24].copy_from_slice(&[0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18]);
+        let field = DataField {
+            raw_header,
+            subtype: 0x0002,
+            content: DataContent::String {
+                encoding: StringEncoding::Utf8,
+                value: "x".to_string(),
+            },
+        };
+
+        let mut w = Writer::new();
+        write_mhoh(&mut w, &field).unwrap();
+        assert_eq!(
+            &w.buf[16..24],
+            &[0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18],
+            "unknown common-header bytes must be preserved"
+        );
+
+        let mut cursor = parse::Cursor::new(&w.buf);
+        let parsed = parse::parse_mhoh(&mut cursor).unwrap();
+        assert_eq!(parsed.raw_header[16..24], w.buf[16..24]);
+        assert_eq!(parsed.as_str(), Some("x"));
     }
 
     #[test]

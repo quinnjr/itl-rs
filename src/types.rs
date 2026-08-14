@@ -171,12 +171,16 @@ pub enum DataContent {
         value: String,
     },
     RawData(Vec<u8>),
+    /// A flex-string data segment preserved verbatim because its encoding
+    /// tag is unknown or its bytes don't decode under the claimed
+    /// encoding. Includes the 16-byte string header, so it is not exposed
+    /// as text — `as_str()` returns `None`.
+    UnknownString(Vec<u8>),
 }
 
 /// A parsed mhoh data field.
 #[derive(Debug, Clone)]
 pub struct DataField {
-    #[allow(dead_code)]
     pub(crate) raw_header: Vec<u8>,
     pub subtype: u32,
     pub content: DataContent,
@@ -191,6 +195,7 @@ impl DataField {
         match &self.content {
             DataContent::String { value, .. } => Some(value.as_str()),
             DataContent::RawData(bytes) => std::str::from_utf8(bytes).ok(),
+            DataContent::UnknownString(_) => None,
         }
     }
 
@@ -199,7 +204,7 @@ impl DataField {
             DataContent::String { value, .. } => {
                 *value = new_value.to_string();
             }
-            DataContent::RawData(_) => {
+            DataContent::RawData(_) | DataContent::UnknownString(_) => {
                 self.content = DataContent::String {
                     encoding: StringEncoding::Utf8,
                     value: new_value.to_string(),
@@ -218,8 +223,14 @@ pub fn apple_to_unix(apple_ts: u32) -> i64 {
 }
 
 /// Convert a Unix timestamp to an Apple timestamp.
+///
+/// The representable range is 1904-01-01 through 2040-02-06 (a u32 count
+/// of Apple seconds); inputs outside that range saturate to the nearest
+/// bound instead of wrapping.
 pub fn unix_to_apple(unix_ts: i64) -> u32 {
-    (unix_ts + APPLE_EPOCH_OFFSET as i64) as u32
+    unix_ts
+        .saturating_add(APPLE_EPOCH_OFFSET as i64)
+        .clamp(0, u32::MAX as i64) as u32
 }
 
 /// A track in the iTunes library.
@@ -239,7 +250,7 @@ impl Track {
     }
 
     pub fn play_count(&self) -> u32 {
-        if self.raw_header.len() > 72 {
+        if self.raw_header.len() >= 72 {
             u32::from_le_bytes(self.raw_header[68..72].try_into().unwrap())
         } else {
             0
@@ -247,7 +258,7 @@ impl Track {
     }
 
     pub fn rating(&self) -> u8 {
-        if self.raw_header.len() > 101 {
+        if self.raw_header.len() >= 101 {
             self.raw_header[100]
         } else {
             0
@@ -255,7 +266,7 @@ impl Track {
     }
 
     pub fn is_checked(&self) -> bool {
-        if self.raw_header.len() > 103 {
+        if self.raw_header.len() >= 103 {
             self.raw_header[102] == 0
         } else {
             true
@@ -263,7 +274,7 @@ impl Track {
     }
 
     pub fn date_added_raw(&self) -> u32 {
-        if self.raw_header.len() > 116 {
+        if self.raw_header.len() >= 116 {
             u32::from_le_bytes(self.raw_header[112..116].try_into().unwrap())
         } else {
             0
@@ -275,7 +286,7 @@ impl Track {
     }
 
     pub fn album_persistent_id(&self) -> u64 {
-        if self.raw_header.len() > 128 {
+        if self.raw_header.len() >= 128 {
             u64::from_le_bytes(self.raw_header[120..128].try_into().unwrap())
         } else {
             0
@@ -512,7 +523,7 @@ pub struct Album {
 
 impl Album {
     pub fn persistent_id(&self) -> u64 {
-        if self.raw_header.len() > 32 {
+        if self.raw_header.len() >= 32 {
             u64::from_le_bytes(self.raw_header[24..32].try_into().unwrap())
         } else {
             0
@@ -520,7 +531,7 @@ impl Album {
     }
 
     pub fn rating(&self) -> u8 {
-        if self.raw_header.len() > 33 {
+        if self.raw_header.len() >= 33 {
             self.raw_header[32]
         } else {
             0
@@ -555,7 +566,7 @@ pub struct Artist {
 
 impl Artist {
     pub fn persistent_id(&self) -> u64 {
-        if self.raw_header.len() > 20 {
+        if self.raw_header.len() >= 20 {
             u64::from_le_bytes(self.raw_header[12..20].try_into().unwrap())
         } else {
             0
@@ -581,12 +592,22 @@ impl Artist {
     }
 }
 
+/// One mtph entry in a playlist: the referenced track ID together with
+/// the original section bytes, so the pairing can never desynchronize.
+#[derive(Debug, Clone)]
+pub(crate) struct PlaylistEntry {
+    pub(crate) track_id: u32,
+    /// Original mtph section bytes; `None` for tracks added through the
+    /// API, for which a canonical section is synthesized on write.
+    pub(crate) raw: Option<Vec<u8>>,
+}
+
 /// A playlist in the iTunes library.
 #[derive(Debug, Clone)]
 pub struct Playlist {
     pub(crate) raw_header: Vec<u8>,
     pub(crate) data_fields: Vec<DataField>,
-    pub(crate) track_ids: Vec<u32>,
+    pub(crate) entries: Vec<PlaylistEntry>,
 }
 
 impl Playlist {
@@ -622,12 +643,11 @@ impl Playlist {
         }
     }
 
+    /// Number of tracks in this playlist. Derived from the entry list so
+    /// it can never go stale; the corresponding header field is kept in
+    /// step by the mutators for on-disk consistency.
     pub fn item_count(&self) -> u32 {
-        if self.raw_header.len() > 16 {
-            u32::from_le_bytes(self.raw_header[12..16].try_into().unwrap())
-        } else {
-            0
-        }
+        self.entries.len() as u32
     }
 
     /// Whether this playlist is a smart playlist.
@@ -656,7 +676,7 @@ impl Playlist {
     /// misclassify any folder as a non-folder; it may rarely classify
     /// an empty regular playlist as a folder.
     pub fn is_folder(&self) -> bool {
-        self.track_ids.is_empty()
+        self.entries.is_empty()
     }
 
     pub fn title(&self) -> Option<&str> {
@@ -666,16 +686,35 @@ impl Playlist {
             .and_then(|f| f.as_str())
     }
 
-    pub fn track_ids(&self) -> &[u32] {
-        &self.track_ids
+    pub fn track_ids(&self) -> Vec<u32> {
+        self.entries.iter().map(|e| e.track_id).collect()
     }
 
     pub fn add_track(&mut self, track_id: u32) {
-        self.track_ids.push(track_id);
+        self.entries.push(PlaylistEntry {
+            track_id,
+            raw: None,
+        });
+        self.sync_item_count();
     }
 
     pub fn remove_track(&mut self, track_id: u32) {
-        self.track_ids.retain(|&id| id != track_id);
+        self.remove_tracks(&std::iter::once(track_id).collect());
+    }
+
+    /// Remove every occurrence of the given track IDs in a single pass.
+    pub fn remove_tracks(&mut self, track_ids: &std::collections::HashSet<u32>) {
+        self.entries.retain(|e| !track_ids.contains(&e.track_id));
+        self.sync_item_count();
+    }
+
+    /// Keep the header's on-disk item-count field in step with the entry
+    /// list after a mutation.
+    fn sync_item_count(&mut self) {
+        if self.raw_header.len() >= 16 {
+            let n = self.entries.len() as u32;
+            self.raw_header[12..16].copy_from_slice(&n.to_le_bytes());
+        }
     }
 
     pub fn data_fields(&self) -> &[DataField] {
@@ -971,24 +1010,112 @@ mod tests {
                 DataFieldType::PlaylistTitle as u32,
                 "My List",
             )],
-            track_ids: vec![1, 2, 3],
+            entries: [1, 2, 3]
+                .into_iter()
+                .map(|track_id| PlaylistEntry {
+                    track_id,
+                    raw: None,
+                })
+                .collect(),
         };
-        assert_eq!(p.item_count(), 99);
+        assert_eq!(p.item_count(), 3, "item_count derives from entries");
         assert_eq!(p.title(), Some("My List"));
         assert_eq!(p.track_ids(), &[1, 2, 3]);
 
         p.add_track(4);
         assert_eq!(p.track_ids(), &[1, 2, 3, 4]);
+        assert_eq!(p.item_count(), 4, "item_count must track add_track");
+        // The on-disk header field is kept in step by the mutators.
+        assert_eq!(&p.raw_header[12..16], &4u32.to_le_bytes());
         p.remove_track(2);
         assert_eq!(p.track_ids(), &[1, 3, 4]);
+        assert_eq!(p.item_count(), 3, "item_count must track remove_track");
+        assert_eq!(&p.raw_header[12..16], &3u32.to_le_bytes());
         assert_eq!(p.data_fields().len(), 1);
+
+        let mut set = std::collections::HashSet::new();
+        set.insert(1);
+        set.insert(4);
+        p.remove_tracks(&set);
+        assert_eq!(p.track_ids(), &[3]);
+        assert_eq!(p.item_count(), 1);
 
         let short = Playlist {
             raw_header: vec![0u8; 10],
             data_fields: Vec::new(),
-            track_ids: Vec::new(),
+            entries: Vec::new(),
         };
         assert_eq!(short.item_count(), 0);
+    }
+
+    #[test]
+    fn unix_to_apple_saturates_out_of_range() {
+        assert_eq!(unix_to_apple(i64::MIN), 0);
+        assert_eq!(unix_to_apple(-(APPLE_EPOCH_OFFSET as i64) - 1), 0);
+        assert_eq!(unix_to_apple(i64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn track_accessors_at_exact_boundary_lengths() {
+        // Headers of exactly the required length must expose the field
+        // (the guards were previously off by one).
+        let mut h = vec![0u8; 72];
+        h[68..72].copy_from_slice(&7u32.to_le_bytes());
+        let t = Track {
+            raw_header: h,
+            data_fields: Vec::new(),
+        };
+        assert_eq!(t.play_count(), 7);
+
+        let mut h = vec![0u8; 101];
+        h[100] = 60;
+        let t = Track {
+            raw_header: h,
+            data_fields: Vec::new(),
+        };
+        assert_eq!(t.rating(), 60);
+
+        let mut h = vec![0u8; 116];
+        h[112..116].copy_from_slice(&5u32.to_le_bytes());
+        let t = Track {
+            raw_header: h,
+            data_fields: Vec::new(),
+        };
+        assert_eq!(t.date_added_raw(), 5);
+
+        let mut h = vec![0u8; 128];
+        h[120..128].copy_from_slice(&9u64.to_le_bytes());
+        let t = Track {
+            raw_header: h,
+            data_fields: Vec::new(),
+        };
+        assert_eq!(t.album_persistent_id(), 9);
+
+        let mut h = vec![0u8; 32];
+        h[24..32].copy_from_slice(&11u64.to_le_bytes());
+        let a = Album {
+            raw_header: h,
+            data_fields: Vec::new(),
+        };
+        assert_eq!(a.persistent_id(), 11);
+
+        let mut h = vec![0u8; 20];
+        h[12..20].copy_from_slice(&13u64.to_le_bytes());
+        let ar = Artist {
+            raw_header: h,
+            data_fields: Vec::new(),
+        };
+        assert_eq!(ar.persistent_id(), 13);
+
+        // Playlist header of exactly 16 bytes: sync_item_count must write
+        // the count field rather than skipping it.
+        let mut p = Playlist {
+            raw_header: vec![0u8; 16],
+            data_fields: Vec::new(),
+            entries: Vec::new(),
+        };
+        p.add_track(9);
+        assert_eq!(&p.raw_header[12..16], &1u32.to_le_bytes());
     }
 
     #[test]
