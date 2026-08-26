@@ -60,6 +60,12 @@ pub enum DataFieldType {
     WorkName = 0x003F,
     MovementName = 0x0040,
     PlaylistTitle = 0x0064,
+    /// Binary smart-playlist rule blob (`SLst…`), byte-identical to the
+    /// `Smart Criteria` value in `iTunes Music Library.xml`.
+    SmartCriteria = 0x0065,
+    /// Smart-playlist flags (live updating, limit, …), byte-identical to
+    /// the XML's `Smart Info`.
+    SmartInfo = 0x0066,
     DisplayArtXml = 0x006D,
     PodcastTitle = 0x00C8,
     AlbumItemName = 0x012C,
@@ -98,6 +104,8 @@ impl DataFieldType {
             0x0016 => Self::FullDescription,
             0x0018 => Self::TvShowTitle,
             0x0019 => Self::EpisodeId,
+            0x0065 => Self::SmartCriteria,
+            0x0066 => Self::SmartInfo,
             0x001B => Self::AlbumArtist,
             0x001C => Self::TvRating,
             0x001D => Self::XmlBlock,
@@ -650,33 +658,66 @@ impl Playlist {
         self.entries.len() as u32
     }
 
-    /// Whether this playlist is a smart playlist.
-    ///
-    /// Currently returns `true` only if the playlist carries an explicit
-    /// `SmartPlaylistXml` data field (subtype `0x02BC`). **This detection
-    /// is not reliable on modern iTunes (12.x+) libraries**, which store
-    /// smart-criteria data under different, not-yet-reverse-engineered
-    /// subtypes. Consumers that need accurate smart/regular classification
-    /// should cross-reference the iTunes XML library or treat all
-    /// playlists uniformly and derive intent from other metadata.
-    pub fn is_smart(&self) -> bool {
+    /// Byte offset (within `raw_header`, i.e. after the 8-byte
+    /// `miph` signature + length) of the folder flag. Located by
+    /// matching every playlist of an iTunes 12.13 library against the
+    /// XML's `Folder` key: 1 for all 9 folders, 0 for all 425 others.
+    /// Byte 514 mirrors it.
+    const FOLDER_FLAG_OFFSET: usize = 457;
+
+    /// The raw bytes of a data field that may have been parsed as a
+    /// string, a flex-string with unknown encoding, or raw data.
+    fn field_bytes(&self, subtype: DataFieldType) -> Option<&[u8]> {
         self.data_fields
             .iter()
-            .any(|f| f.subtype == DataFieldType::SmartPlaylistXml as u32)
+            .find(|f| f.subtype == subtype as u32)
+            .map(|f| match &f.content {
+                DataContent::RawData(b) | DataContent::UnknownString(b) => b.as_slice(),
+                DataContent::String { value, .. } => value.as_bytes(),
+            })
     }
 
-    /// Whether this playlist is a folder (contains other playlists,
-    /// holds no tracks directly).
+    /// The smart-playlist rule blob (`SLst…`), exactly as iTunes writes
+    /// it to the XML's `Smart Criteria`. None for plain playlists.
+    /// Folders carry one too (iTunes stores them as smart containers),
+    /// so check [`Playlist::is_folder`] first when classifying.
+    pub fn smart_criteria(&self) -> Option<&[u8]> {
+        self.field_bytes(DataFieldType::SmartCriteria)
+    }
+
+    /// The smart-playlist flag block (live updating, limit, …), exactly
+    /// as iTunes writes it to the XML's `Smart Info`.
+    pub fn smart_info(&self) -> Option<&[u8]> {
+        self.field_bytes(DataFieldType::SmartInfo)
+    }
+
+    /// Whether this playlist is a smart playlist.
     ///
-    /// Heuristic: a playlist with no direct track entries. iTunes does
-    /// store a folder flag byte in the miph header but the exact offset
-    /// was not reliably identifiable from empirical probing across
-    /// iTunes versions. The heuristic correctly identifies all 9 known
-    /// folders in the iTunes 12 reference library and does not
-    /// misclassify any folder as a non-folder; it may rarely classify
-    /// an empty regular playlist as a folder.
+    /// iTunes 12 stores the rules in the `SmartCriteria` (`0x65`) data
+    /// field; older libraries used `SmartPlaylistXml` (`0x02BC`). Either
+    /// counts. Note that folders also carry criteria — call
+    /// [`Playlist::is_folder`] first to tell them apart.
+    pub fn is_smart(&self) -> bool {
+        self.smart_criteria().is_some()
+            || self
+                .data_fields
+                .iter()
+                .any(|f| f.subtype == DataFieldType::SmartPlaylistXml as u32)
+    }
+
+    /// Whether this playlist is a folder (contains other playlists).
+    ///
+    /// Reads the folder flag byte in the `miph` header. Falls back to
+    /// "has no track entries" only when the header is too short to
+    /// carry the flag (hand-built or truncated headers). Note that in
+    /// real libraries a folder's entry list is *not* empty — it holds
+    /// the union of its children's tracks — which is why the old
+    /// heuristic was wrong in both directions.
     pub fn is_folder(&self) -> bool {
-        self.entries.is_empty()
+        match self.raw_header.get(Self::FOLDER_FLAG_OFFSET) {
+            Some(flag) => *flag == 1,
+            None => self.entries.is_empty(),
+        }
     }
 
     pub fn title(&self) -> Option<&str> {
@@ -1209,5 +1250,90 @@ mod tests {
         track.set_artist("New Artist");
         assert_eq!(track.artist(), Some("New Artist"));
         assert_eq!(track.data_fields.len(), 2);
+    }
+
+    fn playlist_with(
+        header_len: usize,
+        folder_flag: Option<u8>,
+        fields: Vec<DataField>,
+    ) -> Playlist {
+        let mut raw_header = vec![0u8; header_len];
+        if let Some(flag) = folder_flag {
+            raw_header[Playlist::FOLDER_FLAG_OFFSET] = flag;
+        }
+        Playlist {
+            raw_header,
+            data_fields: fields,
+            entries: Vec::new(),
+        }
+    }
+
+    fn raw_field(subtype: DataFieldType, bytes: &[u8]) -> DataField {
+        DataField {
+            raw_header: Vec::new(),
+            subtype: subtype as u32,
+            content: DataContent::UnknownString(bytes.to_vec()),
+        }
+    }
+
+    #[test]
+    fn smart_detection_uses_criteria_field_or_legacy_xml() {
+        let criteria = b"SLst\x00\x01\x00\x01";
+        let p = playlist_with(
+            600,
+            Some(0),
+            vec![raw_field(DataFieldType::SmartCriteria, criteria)],
+        );
+        assert!(p.is_smart());
+        assert_eq!(p.smart_criteria(), Some(&criteria[..]));
+        assert_eq!(p.smart_info(), None);
+
+        let legacy = playlist_with(
+            600,
+            Some(0),
+            vec![raw_field(DataFieldType::SmartPlaylistXml, b"<x/>")],
+        );
+        assert!(legacy.is_smart());
+
+        let plain = playlist_with(
+            600,
+            Some(0),
+            vec![raw_field(DataFieldType::PlaylistTitle, b"T")],
+        );
+        assert!(!plain.is_smart());
+        assert!(plain.smart_criteria().is_none());
+    }
+
+    #[test]
+    fn folder_flag_wins_over_entry_count() {
+        let mut folder = playlist_with(600, Some(1), Vec::new());
+        folder.add_track(1);
+        folder.add_track(2);
+        assert!(folder.is_folder(), "folders hold their children's tracks");
+
+        let empty_plain = playlist_with(600, Some(0), Vec::new());
+        assert!(
+            !empty_plain.is_folder(),
+            "an empty playlist is not a folder"
+        );
+
+        // Header too short to carry the flag: legacy heuristic.
+        let short_empty = playlist_with(16, None, Vec::new());
+        assert!(short_empty.is_folder());
+        let mut short_full = playlist_with(16, None, Vec::new());
+        short_full.add_track(7);
+        assert!(!short_full.is_folder());
+    }
+
+    #[test]
+    fn smart_field_subtypes_are_known() {
+        assert_eq!(
+            DataFieldType::from_u32(0x65),
+            Some(DataFieldType::SmartCriteria)
+        );
+        assert_eq!(
+            DataFieldType::from_u32(0x66),
+            Some(DataFieldType::SmartInfo)
+        );
     }
 }

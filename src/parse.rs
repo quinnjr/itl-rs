@@ -850,7 +850,9 @@ pub(crate) fn parse_mhoh(cursor: &mut Cursor) -> Result<DataField> {
             content,
         })
     } else {
-        let data = cursor.read_bytes(data_size.min(cursor.remaining()))?.to_vec();
+        let data = cursor
+            .read_bytes(data_size.min(cursor.remaining()))?
+            .to_vec();
         Ok(DataField {
             raw_header,
             subtype,
@@ -1966,9 +1968,11 @@ mod tests {
             return;
         };
         let header = crate::header::EnvelopeHeader::parse(&raw).unwrap();
-        let payload =
-            crate::crypto::decrypt_payload(&raw[crate::header::ENVELOPE_LENGTH..], header.max_crypt_size())
-                .unwrap();
+        let payload = crate::crypto::decrypt_payload(
+            &raw[crate::header::ENVELOPE_LENGTH..],
+            header.max_crypt_size(),
+        )
+        .unwrap();
 
         let mut c = Cursor::new(&payload);
         let mut checked = 0usize;

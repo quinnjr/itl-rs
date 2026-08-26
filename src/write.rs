@@ -625,7 +625,9 @@ mod tests {
         junk.extend_from_slice(&[0xEE; 8]);
 
         let mut library = make_empty_library();
-        library.section_order.push(SectionRef::Raw { data: junk.clone() });
+        library
+            .section_order
+            .push(SectionRef::Raw { data: junk.clone() });
 
         let result = serialize_inner(&library).unwrap();
         assert_eq!(result, junk, "raw top-level section re-emitted verbatim");
