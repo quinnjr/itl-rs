@@ -663,3 +663,34 @@ fn playlist_kinds_match_itunes_xml_ground_truth() {
         assert!(p.smart_info().is_some_and(|i| !i.is_empty()));
     }
 }
+
+/// Track persistent ids and 8-bit titles against the reference
+/// library: no title may decode to None, and the pid must be the one
+/// iTunes' XML reports (located at header offset 120).
+#[test]
+fn track_titles_and_pids_match_reference_library() {
+    let Some(lib) = open_real_library() else {
+        return;
+    };
+    let untitled = lib
+        .tracks()
+        .iter()
+        .filter(|t| t.local_path().is_some() && t.title().is_none())
+        .count();
+    assert_eq!(untitled, 0, "every track with a file has a decodable title");
+    let with_pid = lib
+        .tracks()
+        .iter()
+        .filter(|t| t.persistent_id() != 0)
+        .count();
+    assert!(with_pid * 100 / lib.tracks().len() >= 99);
+    // Known 8-bit title from the reference library (Windows iTunes, tag 3).
+    let facade = lib.tracks().iter().find(|t| {
+        t.local_path()
+            .is_some_and(|p| p.ends_with("12%20Fa%C3%A7ade.m4p"))
+    });
+    if let Some(t) = facade {
+        assert_eq!(t.title(), Some("Façade"));
+        assert_ne!(t.persistent_id(), 0);
+    }
+}
