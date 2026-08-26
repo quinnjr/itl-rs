@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `Playlist::is_folder()` now reads the folder flag byte in the `miph`
+  header (offset 457 of the post-length header; located by matching all
+  434 playlists of an iTunes 12.13 library against the XML `Folder` key).
+  The previous "no track entries" heuristic was wrong in both directions:
+  iTunes folders hold the union of their children's tracks, and empty
+  regular playlists exist. Falls back to the heuristic only when the
+  header is too short to carry the flag.
+- `Playlist::is_smart()` now recognises iTunes 12's `SmartCriteria`
+  (`0x65`) data field. Previously only the legacy `SmartPlaylistXml`
+  (`0x02BC`) counted, so no smart playlist in a modern library was
+  detected (0 of 406 in the reference library). Folders carry criteria
+  too — check `is_folder()` first.
+
+### Added
+
+- `DataFieldType::SmartCriteria` (`0x65`) and `DataFieldType::SmartInfo`
+  (`0x66`), plus `Playlist::smart_criteria()` / `smart_info()` returning
+  the raw bytes — byte-identical to the XML's `Smart Criteria` /
+  `Smart Info` values (415/415 in the reference library).
+
 ## [1.0.0] - 2026-08-14
 
 First stable release, following a full conformance/efficiency audit and

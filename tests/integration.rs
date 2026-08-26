@@ -7,8 +7,7 @@ const DEFAULT_ITL_PATH: &str =
 /// `None` (so the test skips instead of panicking) when the file is not
 /// available on this machine.
 fn open_real_library() -> Option<ItlFile> {
-    let path =
-        std::env::var("ITL_TEST_PATH").unwrap_or_else(|_| DEFAULT_ITL_PATH.to_string());
+    let path = std::env::var("ITL_TEST_PATH").unwrap_or_else(|_| DEFAULT_ITL_PATH.to_string());
     if !std::path::Path::new(&path).exists() {
         eprintln!("skipping: real library not found at {path} (set ITL_TEST_PATH to override)");
         return None;
@@ -310,10 +309,8 @@ fn playlist_persistent_id_is_nonzero_and_mostly_unique() {
 
 #[test]
 fn is_smart_agrees_with_datafield_scan() {
-    // is_smart() is known-unreliable on modern iTunes libraries (see
-    // method docs — iTunes 12+ doesn't store SmartPlaylistXml at
-    // subtype 0x02BC). Its contract is "true iff a 0x02BC field is
-    // present". Verify that contract.
+    // Contract: true iff the playlist carries iTunes 12's SmartCriteria
+    // (0x65) field or the legacy SmartPlaylistXml (0x02BC) field.
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini.itl");
     if !path.exists() {
         eprintln!("skipping: tests/fixtures/mini.itl not present");
@@ -323,18 +320,29 @@ fn is_smart_agrees_with_datafield_scan() {
     let lib = itl_rs::ItlFile::open(&path).unwrap();
     assert!(!lib.playlists().is_empty());
     for p in lib.playlists() {
-        let has_xml = p.data_fields().iter().any(|f| f.subtype == 0x02BC);
+        let has_criteria = p
+            .data_fields()
+            .iter()
+            .any(|f| f.subtype == 0x65 || f.subtype == 0x02BC);
         assert_eq!(
             p.is_smart(),
-            has_xml,
+            has_criteria,
             "is_smart() disagrees with data_fields check for {:?}",
             p.title(),
+        );
+        assert_eq!(
+            p.smart_criteria().is_some(),
+            p.data_fields().iter().any(|f| f.subtype == 0x65)
         );
     }
 }
 
 #[test]
-fn folders_have_no_tracks() {
+fn folders_agree_with_parent_links() {
+    // The folder flag must agree with the structure: every playlist that
+    // names a parent points at a folder, and every folder has at least
+    // one child. (Folders DO carry tracks — the union of their
+    // children's — so "no tracks" is not a valid folder test.)
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mini.itl");
     if !path.exists() {
         eprintln!("skipping: tests/fixtures/mini.itl not present");
@@ -342,22 +350,31 @@ fn folders_have_no_tracks() {
     }
 
     let lib = itl_rs::ItlFile::open(&path).unwrap();
-    let mut folder_count = 0usize;
-    for p in lib.playlists() {
-        if p.is_folder() {
-            folder_count += 1;
-            assert!(
-                p.track_ids().is_empty(),
-                "is_folder()==true for {:?} but it has {} tracks",
-                p.title(),
-                p.track_ids().len(),
-            );
-        }
-    }
+    let folders: std::collections::HashSet<u64> = lib
+        .playlists()
+        .iter()
+        .filter(|p| p.is_folder())
+        .map(|p| p.persistent_id())
+        .collect();
+    let parents: std::collections::HashSet<u64> = lib
+        .playlists()
+        .iter()
+        .filter_map(|p| p.parent_persistent_id())
+        .filter(|pid| *pid != 0)
+        .collect();
     assert!(
-        folder_count >= 1,
+        !folders.is_empty(),
         "fixture should contain at least one folder"
     );
+    for pid in &parents {
+        assert!(
+            folders.contains(pid),
+            "parent {pid:016x} is not flagged as a folder"
+        );
+    }
+    for pid in &folders {
+        assert!(parents.contains(pid), "folder {pid:016x} has no children");
+    }
 }
 
 #[test]
@@ -598,4 +615,51 @@ fn playlist_parent_persistent_ids_resolve_to_known_playlists() {
         "only {resolved}/{total} parent pids resolve ({:.1}%)",
         ratio * 100.0,
     );
+}
+
+/// Folder / smart classification against the XML ground truth of the
+/// reference library: iTunes 12.13, 434 playlists, 9 folders, 406 smart.
+#[test]
+fn playlist_kinds_match_itunes_xml_ground_truth() {
+    let Some(lib) = open_real_library() else {
+        return;
+    };
+    let folders: Vec<_> = lib.playlists().iter().filter(|p| p.is_folder()).collect();
+    let smart_non_folder = lib
+        .playlists()
+        .iter()
+        .filter(|p| !p.is_folder() && p.is_smart())
+        .count();
+    let plain = lib
+        .playlists()
+        .iter()
+        .filter(|p| !p.is_folder() && !p.is_smart())
+        .count();
+
+    assert_eq!(
+        folders.len(),
+        9,
+        "folders: {:?}",
+        folders.iter().map(|p| p.title()).collect::<Vec<_>>()
+    );
+    assert!(
+        folders.iter().all(|p| !p.track_ids().is_empty()),
+        "iTunes folders carry the union of their children's tracks"
+    );
+    // The XML lists 406 smart playlists; the ITL keeps 4 more that the
+    // XML deduplicated (all smart), so anchor on the 19 plain ones.
+    assert_eq!(plain, 19);
+    assert_eq!(smart_non_folder, lib.playlists().len() - 9 - 19);
+    assert!(smart_non_folder >= 406);
+
+    for p in lib.playlists().iter().filter(|p| p.is_smart()) {
+        let crit = p.smart_criteria().expect("criteria bytes");
+        assert!(
+            crit.starts_with(b"SLst"),
+            "{:?}: {:?}",
+            p.title(),
+            &crit[..4.min(crit.len())]
+        );
+        assert!(p.smart_info().is_some_and(|i| !i.is_empty()));
+    }
 }
