@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-26
+
+### Fixed
+
+- Tag-3 ("UTF-8") strings whose bytes are not valid UTF-8 now decode as
+  ISO-8859-1 instead of becoming `UnknownString` (so `title()` etc. no
+  longer return `None`). Windows iTunes writes 8-bit strings in the
+  system code page under tag 3; iTunes and its XML export read them as
+  Latin-1, and so does this crate now — 229/229 such titles in the
+  reference library match the XML. New `StringEncoding::Latin1` variant
+  serialises back under tag 3 byte-for-byte (`StringEncoding::tag()`).
+- `Track::persistent_id()` now reads bytes 120..128 of the mhit header,
+  which is the id iTunes' XML reports as `Persistent ID` (2,953 of 2,992
+  tracks matched by file location). Bytes 24..32, read before, are a
+  different identifier that never appears in the XML. Consumers that
+  keyed rows on the old value must re-key.
+
 ## [1.1.0] - 2026-08-26
 
 ### Fixed

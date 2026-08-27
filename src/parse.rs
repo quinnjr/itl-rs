@@ -837,7 +837,18 @@ pub(crate) fn parse_mhoh(cursor: &mut Cursor) -> Result<DataField> {
         // verbatim so serialization is byte-identical.
         let decoded = StringEncoding::try_from(string_type_val)
             .ok()
-            .and_then(|encoding| decode_string(encoding, string_bytes).map(|v| (encoding, v)));
+            .and_then(|encoding| decode_string(encoding, string_bytes).map(|v| (encoding, v)))
+            .or_else(|| {
+                // Tag 3 with bytes that aren't UTF-8: Windows iTunes wrote
+                // the system 8-bit code page. Read it as ISO-8859-1 like
+                // iTunes does; every byte maps, so this never fails.
+                (string_type_val == StringEncoding::Utf8 as u32).then(|| {
+                    (
+                        StringEncoding::Latin1,
+                        string_bytes.iter().map(|&b| b as char).collect::<String>(),
+                    )
+                })
+            });
 
         let content = match decoded {
             Some((encoding, value)) => DataContent::String { encoding, value },
@@ -866,6 +877,7 @@ fn decode_string(encoding: StringEncoding, bytes: &[u8]) -> Option<String> {
         StringEncoding::Utf8 | StringEncoding::Uri | StringEncoding::EscapedUri => {
             std::str::from_utf8(bytes).ok().map(str::to_owned)
         }
+        StringEncoding::Latin1 => Some(bytes.iter().map(|&b| b as char).collect()),
         StringEncoding::Utf16 => {
             if !bytes.len().is_multiple_of(2) {
                 return None;
@@ -1243,6 +1255,37 @@ mod tests {
         // Odd-length UTF-16 is undecodable; the caller preserves the raw
         // bytes instead of mangling them.
         assert_eq!(super::decode_string(StringEncoding::Utf16, &[0x41u8]), None);
+    }
+
+    #[test]
+    fn test_parse_mhoh_tag3_latin1_bytes_decode_and_round_trip() {
+        // "Façade" as Windows iTunes writes it: tag 3, 0xE7 for ç.
+        let bytes = b"Fa\xe7ade";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"mhoh");
+        buf.extend_from_slice(&24u32.to_le_bytes());
+        buf.extend_from_slice(&((24 + 16 + bytes.len()) as u32).to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(bytes);
+        let mut cursor = Cursor::new(&buf);
+        let field = parse_mhoh(&mut cursor).unwrap();
+        match &field.content {
+            DataContent::String { encoding, value } => {
+                assert_eq!(*encoding, StringEncoding::Latin1);
+                assert_eq!(value, "Façade");
+            }
+            other => panic!("expected Latin1 string, got {other:?}"),
+        }
+        assert_eq!(field.as_str(), Some("Façade"));
+        assert_eq!(
+            crate::write::encode_string_for_test(StringEncoding::Latin1, "Façade"),
+            bytes.to_vec()
+        );
+        assert_eq!(StringEncoding::Latin1.tag(), 3);
     }
 
     #[test]

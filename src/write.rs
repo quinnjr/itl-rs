@@ -283,7 +283,7 @@ fn write_mhoh(w: &mut Writer, field: &DataField) -> Result<()> {
         }
         DataContent::String { encoding, value } => {
             let encoded = encode_string(*encoding, value);
-            w.write_u32_le(*encoding as u32);
+            w.write_u32_le(encoding.tag());
             w.write_u32_le(encoded.len() as u32);
             w.write_bytes(&[0u8; 8]); // padding
             w.write_bytes(&encoded);
@@ -309,7 +309,19 @@ fn encode_string(encoding: StringEncoding, value: &str) -> Vec<u8> {
             }
             bytes
         }
+        // Characters outside Latin-1 (only possible after set_string)
+        // become '?', matching what iTunes shows for them.
+        StringEncoding::Latin1 => value
+            .chars()
+            .map(|c| if (c as u32) <= 0xFF { c as u8 } else { b'?' })
+            .collect(),
     }
+}
+
+#[doc(hidden)]
+#[cfg(test)]
+pub(crate) fn encode_string_for_test(encoding: StringEncoding, value: &str) -> Vec<u8> {
+    encode_string(encoding, value)
 }
 
 #[cfg(test)]

@@ -6,6 +6,21 @@ pub enum StringEncoding {
     Utf16 = 1,
     EscapedUri = 2,
     Utf8 = 3,
+    /// Tag 3 bytes that are not valid UTF-8. Windows iTunes writes
+    /// 8-bit strings in the system code page under the same tag; iTunes
+    /// itself (and its XML export) reads them as ISO-8859-1, so we do
+    /// too. Serialises back under tag 3, byte-for-byte.
+    Latin1 = 0x1_0003,
+}
+
+impl StringEncoding {
+    /// The on-disk encoding tag.
+    pub fn tag(self) -> u32 {
+        match self {
+            Self::Latin1 => Self::Utf8 as u32,
+            other => other as u32,
+        }
+    }
 }
 
 impl TryFrom<u32> for StringEncoding {
@@ -305,10 +320,14 @@ impl Track {
     /// as the cross-sync identity key by consumers (e.g., TuxTunes) that
     /// track iTunes imports over time.
     ///
-    /// Layout: bytes 24..32 of the track's mhit header, little-endian.
+    /// Layout: bytes 120..128 of the track's mhit header, little-endian.
+    /// Located by matching 2,953 of 2,992 tracks of an iTunes 12.13
+    /// library (joined by file location) against the XML's
+    /// `Persistent ID`; bytes 24..32, used before 1.2.0, are a different
+    /// identifier that never appears in the XML.
     pub fn persistent_id(&self) -> u64 {
-        if self.raw_header.len() >= 32 {
-            u64::from_le_bytes(self.raw_header[24..32].try_into().unwrap())
+        if self.raw_header.len() >= 128 {
+            u64::from_le_bytes(self.raw_header[120..128].try_into().unwrap())
         } else {
             0
         }
